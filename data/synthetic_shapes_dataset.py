@@ -1,16 +1,17 @@
-import random
-import numpy as np
-from PIL import Image, ImageDraw
-from data.annotations import ShapeType, Annotation, BackgroundType, ShapeOutline, BoundingBox
-import matplotlib.pyplot as plt
-from matplotlib import patches
-from dataclasses import asdict
-import torch
-from torch.utils.data._utils.collate import default_collate
-from torch.utils.data import Dataset
-from typing import cast, Optional, Callable, Any
 import math
+import random
+from dataclasses import asdict
+from typing import Any, Callable, Optional, cast
 
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from matplotlib import patches
+from PIL import Image, ImageDraw
+from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
+
+from data.annotations import Annotation, BackgroundType, BoundingBox, ShapeOutline, ShapeType
 
 rgb_color_type = tuple[int, int, int]
 

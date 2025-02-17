@@ -1,13 +1,14 @@
+from typing import cast
+
+import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from data.synthetic_shapes_dataset import ShapeDataset
-from data.annotations import ShapeType, BackgroundType, ShapeOutline
-import matplotlib.pyplot as plt
-from models.simple_center_net import SimpleCenterNet
-from typing import cast
 
+from data.annotations import BackgroundType, ShapeOutline, ShapeType
+from data.synthetic_shapes_dataset import ShapeDataset
+from models.simple_center_net import SimpleCenterNet
 
 # Define transformation to convert PIL images to tensors.
 transform = transforms.ToTensor()

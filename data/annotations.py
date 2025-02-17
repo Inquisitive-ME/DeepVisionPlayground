@@ -1,7 +1,8 @@
 import random
-from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Tuple, NamedTuple
+from enum import Enum, auto
+from typing import NamedTuple, Tuple
+
 from typing_extensions import Self
 
 

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 # Define a simple CNN that outputs two numbers (x, y center coordinates)
 class SimpleCenterNet(nn.Module):
     def __init__(self) -> None:
