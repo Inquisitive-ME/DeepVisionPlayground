@@ -10,10 +10,17 @@ practical understanding of how deep learning operates on visual data.
 
 ## Current Status
 Synthetic Shapes dataset which produces random rectangles, ellipses, and triangles on to random backgrounds
-Simple model to localize center of single shape
+Example Image:
+![example_synthetic_shapes_image.png](docs/example_synthetic_shapes_image.png)
 
+Simple model to localize center of single shape with option to also classify shape type
+This can be used by running simple_center_net.py it will output 5 samples with label and prediction
+![example_train_single_center.png](docs/example_train_single_center.png)
+
+Where if the shape is also being classified the prediction is the text under the yellow label in red
 
 ## Todo's
 Figure out how to document examples
 Work on network to detect multiple objects
+Add more advanced classes i.e. red square, red square outline, ?
 Lot's more

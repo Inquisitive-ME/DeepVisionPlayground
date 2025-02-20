@@ -14,9 +14,9 @@ class BoundingBox(NamedTuple):
 
 
 class ShapeType(Enum):
-    RECTANGLE = auto()
-    CIRCLE = auto()
-    TRIANGLE = auto()
+    RECTANGLE = 0
+    CIRCLE = 1
+    TRIANGLE = 2
 
 
 class ShapeOutline(Enum):

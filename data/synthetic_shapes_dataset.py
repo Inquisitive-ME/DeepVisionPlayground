@@ -166,6 +166,30 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
         ys: list[int] = [pt[1] for pt in points]
         return (min(xs), min(ys), max(xs), max(ys))
 
+    def rotate_shape_points(self,
+                            shape_points: list[tuple[int, int]],
+                            center: tuple[int | float, int | float],
+                            max_attempts: int = 10
+                            ) -> tuple[list[tuple[int, int]], BoundingBox]:
+        """
+        Attempts to find a rotation angle (in degrees) such that the rotated shape
+        is entirely within the image boundaries.
+        """
+        width, height = self.image_size
+        max_angle = 360.0
+        for _ in range(max_attempts):
+            angle = random.uniform(0, max_angle)
+            angle_rad = math.radians(angle)
+            rotated_corners = [rotate_point(x, y, center[0], center[1], angle_rad) for (x, y) in shape_points]
+            bbox = BoundingBox(*self.compute_bbox_from_shape_points(rotated_corners))
+            if bbox.x_min >= 0 and bbox.y_min >= 0 and bbox.x_max <= width and bbox.y_max <= height:
+                return rotated_corners, bbox
+            max_angle *= 0.25
+
+        bbox = BoundingBox(*self.compute_bbox_from_shape_points(shape_points))
+        return shape_points, bbox
+
+
     def convert_center_to_image_coordinates(self, center: tuple[float, float]) -> tuple[int, int]:
         return (int(round(center[0] * self.image_size[0])),
                 int(round(center[1] * self.image_size[1])))
@@ -227,13 +251,9 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
 
             if shape_type == ShapeType.RECTANGLE:
                 if self.rotate_shapes:
-                    angle = random.uniform(0, 360)
-                    angle_rad = math.radians(angle)
-                    # Define the corners of the rectangle.
                     corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
                     center = ((x0 + x1) / 2, (y0 + y1) / 2)
-                    rotated_corners = [rotate_point(x, y, center[0], center[1], angle_rad) for (x, y) in corners]
-                    bbox = BoundingBox(*self.compute_bbox_from_shape_points(rotated_corners))
+                    rotated_corners, bbox = self.rotate_shape_points(corners, center)
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                         draw.polygon(rotated_corners, fill=shape_color)
                     else:
@@ -255,10 +275,7 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
                 points = [point1, point2, point3]
                 center = ((point1[0] + point2[0] + point3[0]) / 3, (point1[1] + point2[1] + point3[1]) / 3)
                 if self.rotate_shapes:
-                    angle = random.uniform(0, 360)
-                    angle_rad = math.radians(angle)
-                    points = [rotate_point(x, y, center[0], center[1], angle_rad) for (x, y) in points]
-                    bbox = BoundingBox(*self.compute_bbox_from_shape_points(points))
+                    points, bbox = self.rotate_shape_points(points, center)
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                     draw.polygon(points, fill=shape_color)
                 else:
@@ -290,10 +307,10 @@ if __name__ == '__main__':
     # Instantiate the dataset with a small number of images for quick testing.
     dataset = ShapeDataset(num_images=10,
                            image_size=(256, 256),
-                           num_shapes_range=(10, 10),
+                           num_shapes_range=(1, 10),
                            shape_size_range=(20, 100),
-                           background=BackgroundType.TEXTURE,
-                           shape_outline=ShapeOutline.FILL,
+                           background=BackgroundType.RANDOM,
+                           shape_outline=ShapeOutline.RANDOM,
                            add_noise=True,
                            fixed_dataset=False)
 
