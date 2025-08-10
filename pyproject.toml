@@ -1,12 +1,17 @@
 [tool.ruff]
 line-length = 120
-select = ["E", "F", "I", "TCH"]  # Enable error codes
 
 [tool.ruff.lint]
 fixable = ["I"]  # Allow auto-fix for imports only
+select = ["E", "F", "I", "TCH"]  # Enable error codes
 
 [tool.mypy]
-strict = true  # Enable strict type checking
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
 
 [[tool.mypy.overrides]]
 module = "torchvision.*"

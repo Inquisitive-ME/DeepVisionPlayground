@@ -1,4 +1,7 @@
+import glob
+import json
 import math
+import os
 import random
 from dataclasses import asdict
 from typing import Any, Callable, Optional, cast
@@ -11,7 +14,7 @@ from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 from torch.utils.data._utils.collate import default_collate
 
-from data.annotations import Annotation, BackgroundType, BoundingBox, ShapeOutline, ShapeType
+from data.annotations import Annotation, AnnotationEncoder, BackgroundType, BoundingBox, ShapeOutline, ShapeType
 
 rgb_color_type = tuple[int, int, int]
 
@@ -30,7 +33,8 @@ def add_gaussian_noise(image: Image.Image,
 def compute_overlap_ratio(box1: BoundingBox, box2: BoundingBox) -> float:
     """
     Compute the overlap ratio between two bounding boxes.
-    The ratio is defined as the area of intersection divided by the area of the smaller box.
+    The ratio is defined as the area of intersection divided by
+    the area of the smaller box.
     """
     x_left = max(box1.x_min, box2.x_min)
     y_top = max(box1.y_min, box2.y_min)
@@ -50,7 +54,7 @@ def compute_overlap_ratio(box1: BoundingBox, box2: BoundingBox) -> float:
 
 def is_overlapping(new_box: BoundingBox,
                    existing_boxes: list[BoundingBox],
-                   iou_threshold: float = 0.3) ->bool:
+                   iou_threshold: float = 0.3) -> bool:
     total_overlap = 0.0
     for box in existing_boxes:
         overlap_ratio = compute_overlap_ratio(new_box, box)
@@ -68,25 +72,36 @@ def color_distance(c1: rgb_color_type, c2: rgb_color_type) -> float:
 
 
 def select_shape_color(bg_color: rgb_color_type,
-                       threshold: float=50) -> rgb_color_type:
+                       threshold: float = 50) -> rgb_color_type:
     # Try a few times to pick a color that is sufficiently different from the background.
     for _ in range(10):
-        candidate = cast(rgb_color_type, tuple(random.randint(0, 255) for _ in range(3)))
+        candidate = cast(
+            rgb_color_type,
+            tuple(random.randint(0, 255) for _ in range(3))
+        )
         if color_distance(candidate, bg_color) > threshold:
             return candidate
     # If a sufficiently different color isn't found, just return a random color.
     return candidate
 
 
-def rotate_point(x: float, y: float, cx: float, cy: float, angle_rad: float) -> tuple[int, int]:
+def rotate_point(x: float,
+                 y: float,
+                 cx: float,
+                 cy: float,
+                 angle_rad: float) -> tuple[int, int]:
     dx: float = x - cx
     dy: float = y - cy
-    x_new: int = int(round(cx + dx * math.cos(angle_rad) - dy * math.sin(angle_rad)))
-    y_new: int = int(round(cy + dx * math.sin(angle_rad) + dy * math.cos(angle_rad)))
+    x_new: int = int(round(
+        cx + dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+    ))
+    y_new: int = int(round(
+        cy + dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+    ))
     return x_new, y_new
 
 
-class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]]):
+class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
     def __init__(self,
                  num_images: int = 1000,
                  image_size: tuple[int, int] = (256, 256),
@@ -99,7 +114,8 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
                  shape_outline: ShapeOutline = ShapeOutline.RANDOM,
                  rotate_shapes: bool = True,
                  max_overlap: float = 0.6,
-                 transform: Optional[Callable[[Any], Any]] = None):
+                 transform: Optional[Callable[[Any], Any]] = None,
+                 save_location: str = "shape_dataset",):
         self.num_images = num_images
         self.image_size = image_size
         self.num_shapes_range = num_shapes_range
@@ -112,9 +128,39 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
         self.rotate_shapes = rotate_shapes
         self.max_overlap = max_overlap
         self.transform = transform
+        self.save_location = save_location
 
         if self.fixed_dataset:
-            self.data = [self.generate_image() for _ in range(num_images)]
+            images_path = os.path.join(self.save_location, "images")
+            annotations_path = os.path.join(self.save_location, "annotations")
+            # Load images from saved location
+            self.data = []
+            if os.path.exists(images_path) and os.path.exists(annotations_path):
+                image_paths = glob.glob(os.path.join(images_path, "*.png"))
+                print("loading {} images and annotations from {}".format(
+                    len(image_paths), self.save_location))
+                for image_file in image_paths:
+                    annotation_file = os.path.join(annotations_path,
+                                                   os.path.basename(image_file).replace(".png", ".json"))
+                    with open(annotation_file, 'r') as f:
+                        annotations = json.load(f)
+                    converted_annotations = [
+                        Annotation.from_dict(annotation)
+                        for annotation in annotations
+                    ]
+                    image = Image.open(image_file).convert("RGB")
+                    image.load()
+                    self.data.append((image, converted_annotations))
+            else:
+                os.makedirs(images_path, exist_ok=True)
+                os.makedirs(annotations_path, exist_ok=True)
+                for i in range(num_images):
+                    img, annotations = self.generate_image()
+                    self.data.append((img, annotations))
+                    img.save(os.path.join(images_path, f"{i}.png"))
+                    # Save to file
+                    with open(os.path.join(annotations_path, f'{i}.json'), 'w') as f:
+                        json.dump(annotations, f, cls=AnnotationEncoder, indent=4)
 
     def __len__(self) -> int:
         return self.num_images
@@ -135,7 +181,7 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
         images, annotations = zip(*batch)
 
         # Convert images using the default collate function (they're tensors)
-        images = default_collate(images)  # type: ignore
+        images = default_collate(images)
 
         def annotation_to_dict(ann: Annotation) -> dict[Any, Any]:
             # Convert the dataclass to a dict.
@@ -152,15 +198,19 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
         return images, new_annotations
 
     @staticmethod
-    def compute_bbox_from_shape_points(points: list[tuple[int, int]]) -> tuple[int, int, int, int]:
+    def compute_bbox_from_shape_points(
+        points: list[tuple[int, int]]
+    ) -> tuple[int, int, int, int]:
         """
         Compute the axis-aligned bounding box for a list of points.
 
         Args:
-            points: A list of (x, y) tuples representing the vertices of a shape.
+            points: A list of (x, y) tuples representing
+                the vertices of a shape.
 
         Returns:
-            A tuple (min_x, min_y, max_x, max_y) representing the bounding box.
+            A tuple (min_x, min_y, max_x, max_y) representing
+                the bounding box.
         """
         xs: list[int] = [pt[0] for pt in points]
         ys: list[int] = [pt[1] for pt in points]
@@ -188,7 +238,6 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
 
         bbox = BoundingBox(*self.compute_bbox_from_shape_points(shape_points))
         return shape_points, bbox
-
 
     def convert_center_to_image_coordinates(self, center: tuple[float, float]) -> tuple[int, int]:
         return (int(round(center[0] * self.image_size[0])),
@@ -233,12 +282,17 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
                 y1 = y0 + shape_height
                 bbox = None
 
-                if not is_overlapping(BoundingBox(x0, y0, x1, y1), existing_boxes, iou_threshold=self.max_overlap):
+                if not is_overlapping(
+                    BoundingBox(x0, y0, x1, y1),
+                    existing_boxes,
+                    iou_threshold=self.max_overlap
+                ):
                     bbox = BoundingBox(x0, y0, x1, y1)
                     existing_boxes.append(bbox)
                     break
             if bbox is None:
-                print("Could not find non overlapping {} in {} iterations".format(shape_type, num_trys))
+                print("Could not find non overlapping {} in {} iterations".format(
+                    shape_type, num_trys))
                 continue
 
             draw = ImageDraw.Draw(img)
@@ -255,31 +309,62 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
                     center = ((x0 + x1) / 2, (y0 + y1) / 2)
                     rotated_corners, bbox = self.rotate_shape_points(corners, center)
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
-                        draw.polygon(rotated_corners, fill=shape_color)
+                        draw.polygon(
+                            rotated_corners,
+                            fill=shape_color
+                        )
                     else:
-                        draw.polygon(rotated_corners, outline=shape_color, width=outline_width)
+                        draw.polygon(
+                            rotated_corners,
+                            outline=shape_color,
+                            width=outline_width
+                        )
                 else:
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
-                        draw.rectangle(bbox, fill=shape_color)
+                        draw.rectangle(
+                            bbox,
+                            fill=shape_color
+                        )
                     else:
-                        draw.rectangle(bbox, outline=shape_color, width=outline_width)
+                        draw.rectangle(
+                            bbox,
+                            outline=shape_color,
+                            width=outline_width
+                        )
             elif shape_type == ShapeType.CIRCLE:
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
-                    draw.ellipse(bbox, fill=shape_color)
+                    draw.ellipse(
+                        bbox,
+                        fill=shape_color
+                    )
                 else:
-                    draw.ellipse(bbox, outline=shape_color, width=outline_width)
+                    draw.ellipse(
+                        bbox,
+                        outline=shape_color,
+                        width=outline_width
+                    )
             elif shape_type == ShapeType.TRIANGLE:
                 point1 = (x0 + random.randint(0, shape_width), y0)
                 point2 = (x0, y1)
                 point3 = (x1, y1)
                 points = [point1, point2, point3]
-                center = ((point1[0] + point2[0] + point3[0]) / 3, (point1[1] + point2[1] + point3[1]) / 3)
+                center = (
+                    (point1[0] + point2[0] + point3[0]) / 3,
+                    (point1[1] + point2[1] + point3[1]) / 3
+                )
                 if self.rotate_shapes:
                     points, bbox = self.rotate_shape_points(points, center)
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
-                    draw.polygon(points, fill=shape_color)
+                    draw.polygon(
+                        points,
+                        fill=shape_color
+                    )
                 else:
-                    draw.polygon(points, outline=shape_color, width=outline_width)
+                    draw.polygon(
+                        points,
+                        outline=shape_color,
+                        width=outline_width
+                    )
             else:
                 assert False, "Wrong shape type"
             if shape_type != ShapeType.TRIANGLE:
@@ -293,7 +378,6 @@ class ShapeDataset(Dataset[tuple[Image.Image | torch.Tensor, list[Annotation]]])
             img = add_gaussian_noise(img)
 
         return img, annotations
-
 
     def get_classes(self) -> list[str]:
         """
@@ -339,7 +423,13 @@ if __name__ == '__main__':
         # Draw the center point.
         ax.plot(*dataset.convert_center_to_image_coordinates(center), 'bo')
         # Optionally, add the shape type as a label.
-        ax.text(bbox[0], bbox[1] - 5, ann.shape.name, color='yellow', fontsize=8, backgroundcolor='black')
+        ax.text(
+            bbox[0], bbox[1] - 5,
+            ann.shape.name,
+            color='yellow',
+            fontsize=8,
+            backgroundcolor='black'
+        )
 
     ax.set_title("Sample from ShapeDataset")
     ax.axis('off')

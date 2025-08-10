@@ -10,7 +10,8 @@ from torchvision import transforms
 
 from data.annotations import BackgroundType, ShapeOutline, ShapeType
 from data.synthetic_shapes_dataset import ShapeDataset
-from models.simple_center_net import EncodeType, ModelType, SimpleCenterNet
+from models.encoders import EncodeType
+from models.simple_center_net import ModelType, SimpleCenterNet
 
 # Define transformation to convert PIL images to tensors.
 transform = transforms.ToTensor()
@@ -29,7 +30,12 @@ dataset = ShapeDataset(
     rotate_shapes=True,
 )
 
-dataloader = DataLoader(dataset, batch_size=100, shuffle=True, collate_fn=ShapeDataset.collate_function)
+dataloader = DataLoader(
+    dataset,
+    batch_size=100,
+    shuffle=True,
+    collate_fn=ShapeDataset.collate_function
+)
 
 # Set up device, model, optimizer, and loss function.
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,7 +45,9 @@ model = SimpleCenterNet(len(dataset.get_classes()),
                         model_type=model_type,
                         encoder_type=EncodeType.simple).to(device)
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=15)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.7, patience=15
+)
 mse_loss = torch.nn.MSELoss()
 cross_entropy_loss = torch.nn.CrossEntropyLoss()
 num_epochs = 100
@@ -58,7 +66,9 @@ for epoch in range(num_epochs):
             centers.append(center)
             object_classes.append(ann[0]["shape"])
         centers_tensor = torch.tensor(centers, dtype=torch.float32).to(device)
-        object_classes_tensor = torch.tensor(object_classes, dtype=torch.uint8).to(device)
+        object_classes_tensor = torch.tensor(
+            object_classes, dtype=torch.uint8
+        ).to(device)
         optimizer.zero_grad()
         model_outputs = model(images)
         if model_type is ModelType.center_localization:
@@ -66,7 +76,9 @@ for epoch in range(num_epochs):
         elif model_type is ModelType.center_localization_and_class_id:
             center_predictions = model_outputs[:, :2]
             class_predictions = model_outputs[:, 2:]
-            class_loss = F.cross_entropy(class_predictions, object_classes_tensor)
+            class_loss = F.cross_entropy(
+                class_predictions, object_classes_tensor
+            )
             loss = (mse_loss(center_predictions, centers_tensor) + class_loss)
         else:
             assert False, "Unsupported Model Type"
@@ -80,7 +92,10 @@ for epoch in range(num_epochs):
     scheduler.step(epoch_loss)
     new_lr = optimizer.param_groups[0]["lr"]
     if new_lr != prev_lr:
-        print(f"Learning rate reduced from {prev_lr:.6f} to {new_lr:.6f} at epoch {epoch + 1}")
+        print(
+            f"Learning rate reduced from {prev_lr:.6f} to {new_lr:.6f} "
+            f"at epoch {epoch + 1}"
+        )
     print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}")
 
 print("Training complete.")
@@ -110,27 +125,27 @@ with torch.no_grad():
         ax.imshow(image_np)
 
         ax.scatter(*dataset.convert_center_to_image_coordinates(pred_center),
-                    marker='x',
-                    color='red',
-                    s=100,
-                    label='Predicted')
+                   marker='x',
+                   color='red',
+                   s=100,
+                   label='Predicted')
         ax.scatter(*dataset.convert_center_to_image_coordinates(gt_center),
-                    marker='o',
-                    color='green',
-                    s=100,
-                    label='Ground Truth')
+                   marker='o',
+                   color='green',
+                   s=100,
+                   label='Ground Truth')
         ax.text(ann[0].bbox[0], ann[0].bbox[1] - 5,
-                 ann[0].shape.name,
-                 color='yellow',
-                 fontsize=8,
-                 backgroundcolor='black')
+                ann[0].shape.name,
+                color='yellow',
+                fontsize=8,
+                backgroundcolor='black')
 
         if model_type is ModelType.center_localization_and_class_id:
             ax.text(ann[0].bbox[0], ann[0].bbox[1] + 10,
-                     pred_shape_class.name,
-                     color='red',
-                     fontsize=8,
-                     backgroundcolor='black')
+                    pred_shape_class.name,
+                    color='red',
+                    fontsize=8,
+                    backgroundcolor='black')
 
         bbox = ann[0].bbox
         # Draw the bounding box.

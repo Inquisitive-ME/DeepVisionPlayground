@@ -27,8 +27,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Ruff (Lint + Type Check)
-        run: ruff check . --output-format=github
-
-      - name: Run mypy
-        run:  mypy --no-error-summary --namespace-packages --explicit-package-bases --check-untyped-defs .
+      - name: Run pre-commit
+        run: pre-commit run --all-files

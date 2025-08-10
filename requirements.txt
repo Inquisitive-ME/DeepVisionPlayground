@@ -6,3 +6,5 @@ matplotlib>=3.3.0
 pytest>=6.0.0
 ruff
 mypy
+flake8
+pre-commit

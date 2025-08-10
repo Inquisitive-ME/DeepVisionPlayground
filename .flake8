@@ -1,0 +1,9 @@
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    .ci
+    .cache/pip,
+    venv,
+    .mypy_cache,
+max-line-length=120
