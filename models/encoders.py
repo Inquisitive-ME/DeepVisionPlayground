@@ -31,7 +31,7 @@ def encoder(encoder_type: EncodeType):
         model = models.resnet18(pretrained=False)
         # Ensure model.fc is a Linear layer with in_features attribute
         if hasattr(model.fc, 'in_features'):
-            features_out_size = model.fc.in_features  # type: ignore[assignment]
+            features_out_size = model.fc.in_features
         else:
             features_out_size = 512  # Default size for resnet18
         model.fc = nn.Identity()

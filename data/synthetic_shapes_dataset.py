@@ -68,7 +68,7 @@ def is_overlapping(new_box: BoundingBox,
 
 def color_distance(c1: rgb_color_type, c2: rgb_color_type) -> float:
     # Euclidean distance in RGB space.
-    return cast(float, sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5)
+    return cast("float", sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5)
 
 
 def select_shape_color(bg_color: rgb_color_type,
@@ -76,7 +76,7 @@ def select_shape_color(bg_color: rgb_color_type,
     # Try a few times to pick a color that is sufficiently different from the background.
     for _ in range(10):
         candidate = cast(
-            rgb_color_type,
+            "rgb_color_type",
             tuple(random.randint(0, 255) for _ in range(3))
         )
         if color_distance(candidate, bg_color) > threshold:
@@ -257,7 +257,7 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
             bg_color = tuple(int(x) for x in np.mean(noise_array, axis=(0, 1)).astype(np.uint8))
         else:
             assert False, "Wrong background type"
-        bg_color = cast(tuple[int, int, int], bg_color)
+        bg_color = cast("tuple[int, int, int]", bg_color)
 
         annotations = []
 

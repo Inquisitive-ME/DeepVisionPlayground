@@ -120,7 +120,7 @@ with torch.no_grad():
     for sample_num in range(num_samples_to_show):
         image, annotations = next(data_iter)
 
-        image = cast(torch.Tensor, image).to(device)
+        image = cast("torch.Tensor", image).to(device)
         model_outputs = model(image.unsqueeze(0))
         model_outputs = model.filter_predictions(model_outputs, confidence_threshold=0.5)[0]
 

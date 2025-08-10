@@ -112,7 +112,7 @@ with torch.no_grad():
         # Assume there's one shape per image.
         gt_center = ann[0].center
 
-        image = cast(torch.Tensor, image).to(device)
+        image = cast("torch.Tensor", image).to(device)
         model_outputs = model(image.unsqueeze(0))
         pred_center = model_outputs.cpu().numpy()[0, :2]
         if model_type is ModelType.center_localization_and_class_id:
