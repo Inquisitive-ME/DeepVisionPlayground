@@ -33,10 +33,11 @@ def add_gaussian_noise(image: Image.Image,
 
 
 def compute_overlap_ratio(box1: BoundingBox, box2: BoundingBox) -> float:
-    """
-    Compute the overlap ratio between two bounding boxes.
-    The ratio is defined as the area of intersection divided by
-    the area of the smaller box.
+    """Intersection area divided by the smaller of the two box areas.
+
+    This is *not* IoU. It measures "how much of the smaller box is contained
+    in the larger one" — 1.0 means the smaller box is fully inside the larger.
+    Used to keep generated shapes from sitting on top of each other.
     """
     x_left = max(box1.x_min, box2.x_min)
     y_top = max(box1.y_min, box2.y_min)
@@ -56,16 +57,18 @@ def compute_overlap_ratio(box1: BoundingBox, box2: BoundingBox) -> float:
 
 def is_overlapping(new_box: BoundingBox,
                    existing_boxes: list[BoundingBox],
-                   iou_threshold: float = 0.3) -> bool:
-    total_overlap = 0.0
-    for box in existing_boxes:
-        overlap_ratio = compute_overlap_ratio(new_box, box)
-        if overlap_ratio > iou_threshold:
-            return True
-        total_overlap += overlap_ratio
-    if total_overlap > iou_threshold:
-        return True
-    return False
+                   max_overlap_ratio: float = 0.3) -> bool:
+    """True if `new_box` overlaps any existing box by more than the threshold.
+
+    The threshold is on the per-pair `compute_overlap_ratio` (intersection
+    over min area), not on a sum across pairs — summing ratios across
+    unrelated boxes was meaningless and caused spurious rejections when the
+    canvas got crowded.
+    """
+    return any(
+        compute_overlap_ratio(new_box, box) > max_overlap_ratio
+        for box in existing_boxes
+    )
 
 
 def color_distance(c1: rgb_color_type, c2: rgb_color_type) -> float:
@@ -307,7 +310,7 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 if not is_overlapping(
                     BoundingBox(x0, y0, x1, y1),
                     existing_boxes,
-                    iou_threshold=self.max_overlap
+                    max_overlap_ratio=self.max_overlap,
                 ):
                     bbox = BoundingBox(x0, y0, x1, y1)
                     existing_boxes.append(bbox)
