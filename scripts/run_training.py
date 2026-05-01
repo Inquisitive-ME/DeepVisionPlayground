@@ -66,6 +66,10 @@ class RunConfig:
     val_shape_counts: tuple[int, ...]
     val_shape_sizes: tuple[tuple[int, int], ...]
     val_overlaps: tuple[float, ...]
+    train_background: str
+    train_outline: str
+    train_add_noise: bool
+    train_shape_size: str
 
 
 def parse_args() -> RunConfig:
@@ -121,6 +125,22 @@ def parse_args() -> RunConfig:
             "Output stride for heatmap models. 4 = 64x64 heatmap on 256-px input, "
             "fast and ~2-3 px median error. 2 = 128x128, sub-pixel error. 1 = 256x256."
         ),
+    )
+    p.add_argument(
+        "--train-background", choices=("solid", "texture", "random"), default="solid",
+        help="Training-time background type. RANDOM mixes solid and texture.",
+    )
+    p.add_argument(
+        "--train-outline", choices=("fill", "thin", "thick", "random"), default="fill",
+        help="Training-time shape outline. RANDOM mixes fill and outline thickness.",
+    )
+    p.add_argument(
+        "--train-add-noise", action="store_true",
+        help="Add Gaussian noise (sigma=10) to training images.",
+    )
+    p.add_argument(
+        "--train-shape-size", type=str, default="",
+        help="Override training shape_size_range as 'min:max' (e.g. '10:200').",
     )
     p.add_argument(
         "--val-shape-counts", type=str, default="",
@@ -183,6 +203,10 @@ def parse_args() -> RunConfig:
         val_shape_counts=val_shape_counts,
         val_shape_sizes=tuple(val_shape_sizes),
         val_overlaps=val_overlaps,
+        train_background=args.train_background,
+        train_outline=args.train_outline,
+        train_add_noise=args.train_add_noise,
+        train_shape_size=args.train_shape_size,
     )
 
 
@@ -471,13 +495,36 @@ def main() -> None:
         # Multi heatmap shares the multi data shape (variable shapes per image).
         train_kwargs["rotate_shapes"] = False
 
+    # Apply training-time augmentation overrides.
+    if cfg.train_background != "solid":
+        train_kwargs["background"] = BackgroundType[cfg.train_background.upper()]
+    if cfg.train_outline != "fill":
+        train_kwargs["shape_outline"] = ShapeOutline[cfg.train_outline.upper()]
+    if cfg.train_add_noise:
+        train_kwargs["add_noise"] = True
+    if cfg.train_shape_size:
+        size_lo_str, size_hi_str = cfg.train_shape_size.split(":")
+        train_kwargs["shape_size_range"] = (int(size_lo_str), int(size_hi_str))
+
     train_seed = cfg.seed if cfg.seed != 0 else None
 
     if cfg.gpu_data:
         if device.type != "cuda":
             raise RuntimeError("--gpu-data requires CUDA")
         if train_kwargs["background"] is not BackgroundType.SOLID:
-            raise NotImplementedError("GpuShapeLoader only supports SOLID backgrounds")
+            raise NotImplementedError(
+                "--gpu-data only supports SOLID backgrounds; remove --gpu-data "
+                "to use the CPU PIL path with backgrounds/outlines/noise."
+            )
+        if train_kwargs["shape_outline"] is not ShapeOutline.FILL:
+            raise NotImplementedError(
+                "--gpu-data only supports filled shapes. Drop --gpu-data for "
+                "outline experiments."
+            )
+        if train_kwargs.get("add_noise"):
+            raise NotImplementedError(
+                "--gpu-data does not support add_noise. Drop --gpu-data."
+            )
         gpu_kwargs = dict(
             image_size=img_size,
             num_shapes_range=train_kwargs["num_shapes_range"],
@@ -701,10 +748,10 @@ def main() -> None:
                     )
                 )
                 final_metrics_by_count[n] = vm_n
-                hi = vm_n.get("multi/mean_matched_center_px", 0.0)
+                mp = vm_n.get("multi/mean_matched_center_px", 0.0)
                 acc = vm_n.get("multi/matched_class_accuracy", 0.0)
                 pmap = vm_n.get("multi/map_center", 0.0)
-                print(f"  count={n:3d}: mean_px={hi:6.2f}  acc={acc:.3f}  map_center={pmap:.3f}")
+                print(f"  count={n:3d}: mean_px={mp:6.2f}  acc={acc:.3f}  map_center={pmap:.3f}")
 
             for lo, hi in cfg.val_shape_sizes:
                 sweep_loader = _build_sweep_loader(
