@@ -57,6 +57,8 @@ class RunConfig:
     val_seed: int
     num_workers: int
     gpu_data: bool
+    lambda_class: float
+    lambda_conf: float
 
 
 def parse_args() -> RunConfig:
@@ -94,6 +96,14 @@ def parse_args() -> RunConfig:
             "instead of CPU PIL workers. Way higher GPU utilization."
         ),
     )
+    p.add_argument(
+        "--lambda-class", type=float, default=1.0,
+        help="Multi-object loss weight on the classification cross-entropy.",
+    )
+    p.add_argument(
+        "--lambda-conf", type=float, default=1.0,
+        help="Multi-object loss weight on the confidence BCE.",
+    )
     args = p.parse_args()
 
     hd = tuple(int(x) for x in args.hidden_dims.split(",") if x) if args.hidden_dims else ()
@@ -114,6 +124,8 @@ def parse_args() -> RunConfig:
         val_seed=args.val_seed,
         num_workers=args.num_workers,
         gpu_data=args.gpu_data,
+        lambda_class=args.lambda_class,
+        lambda_conf=args.lambda_conf,
     )
 
 
@@ -287,7 +299,11 @@ def main() -> None:
 
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     mse = torch.nn.MSELoss()
-    multi_loss = CenterPredictionLoss(model_type=model_type)
+    multi_loss = CenterPredictionLoss(
+        model_type=model_type,
+        lambda_class=cfg.lambda_class,
+        lambda_conf=cfg.lambda_conf,
+    )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     run_name = f"{cfg.task}_{cfg.encoder}_{img_size[0]}_bs{cfg.batch_size}"
