@@ -1,0 +1,253 @@
+"""Evaluation metrics for center-based shape detectors.
+
+Two model families are supported:
+
+- Single-object: prediction tensor is shape (B, 2 [+ num_classes]), GT is one
+  center per image. Reported metrics are pixel-distance and classification
+  accuracy.
+
+- Multi-object: prediction tensor is shape (B, max_objects, 3 [+ num_classes])
+  with sigmoid'd confidence in slot 2. GT is a list[Tensor] of variable
+  length. Predictions above ``confidence_threshold`` are matched to GT with
+  the Hungarian algorithm; reported metrics are mean center distance,
+  classification accuracy on matched pairs, cardinality error, and a center-
+  mAP-style score over a sweep of pixel thresholds.
+
+All metrics are reported in PIXEL space, given the dataset's ``image_size``.
+This keeps numbers interpretable across image resolutions ("how many pixels
+off was the center?") and matches the stated benchmarking goal.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+from scipy.optimize import linear_sum_assignment
+
+DEFAULT_PIXEL_THRESHOLDS: tuple[int, ...] = (2, 4, 8, 16)
+
+
+@dataclass
+class SingleObjectMetrics:
+    mean_center_px: float = 0.0
+    median_center_px: float = 0.0
+    accuracy: float = 0.0
+    n_images: int = 0
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "single/mean_center_px": self.mean_center_px,
+            "single/median_center_px": self.median_center_px,
+            "single/accuracy": self.accuracy,
+        }
+
+
+@dataclass
+class MultiObjectMetrics:
+    mean_matched_center_px: float = 0.0
+    median_matched_center_px: float = 0.0
+    matched_class_accuracy: float = 0.0
+    cardinality_error: float = 0.0
+    mean_conf_matched: float = 0.0
+    mean_conf_unmatched: float = 0.0
+    precision_at: dict[int, float] = field(default_factory=dict)
+    recall_at: dict[int, float] = field(default_factory=dict)
+    map_center: float = 0.0  # average over thresholds of (P*R) ... see below
+    n_images: int = 0
+    n_gt: int = 0
+    n_pred: int = 0
+
+    def to_dict(self) -> dict[str, float]:
+        out: dict[str, float] = {
+            "multi/mean_matched_center_px": self.mean_matched_center_px,
+            "multi/median_matched_center_px": self.median_matched_center_px,
+            "multi/matched_class_accuracy": self.matched_class_accuracy,
+            "multi/cardinality_error": self.cardinality_error,
+            "multi/mean_conf_matched": self.mean_conf_matched,
+            "multi/mean_conf_unmatched": self.mean_conf_unmatched,
+            "multi/map_center": self.map_center,
+        }
+        for t, p in self.precision_at.items():
+            out[f"multi/precision@{t}px"] = p
+        for t, r in self.recall_at.items():
+            out[f"multi/recall@{t}px"] = r
+        return out
+
+
+def _normalized_centers_to_pixels(
+    centers: torch.Tensor | np.ndarray, image_size: tuple[int, int]
+) -> np.ndarray:
+    """Convert (..., 2) normalized centers to pixel coordinates."""
+    arr = centers.detach().cpu().numpy() if isinstance(centers, torch.Tensor) else np.asarray(centers)
+    w, h = image_size
+    scaled = arr.copy().astype(np.float64)
+    scaled[..., 0] *= w
+    scaled[..., 1] *= h
+    return scaled
+
+
+def evaluate_single_object(
+    preds: torch.Tensor,
+    gt_centers: torch.Tensor,
+    image_size: tuple[int, int],
+    gt_classes: torch.Tensor | None = None,
+    has_classes: bool = False,
+) -> SingleObjectMetrics:
+    """Evaluate a single-object center predictor on one batch.
+
+    Args:
+        preds: (B, 2 [+ num_classes]) — sigmoided centers + class logits.
+        gt_centers: (B, 2) — normalized GT centers.
+        gt_classes: (B,) long — GT class indices (only used if has_classes).
+    """
+    pred_px = _normalized_centers_to_pixels(preds[:, :2], image_size)
+    gt_px = _normalized_centers_to_pixels(gt_centers, image_size)
+    distances = np.linalg.norm(pred_px - gt_px, axis=-1)
+
+    accuracy = 0.0
+    if has_classes and gt_classes is not None and preds.shape[-1] > 2:
+        pred_classes = preds[:, 2:].argmax(dim=-1).detach().cpu().numpy()
+        gt_class_arr = gt_classes.detach().cpu().numpy()
+        accuracy = float((pred_classes == gt_class_arr).mean())
+
+    return SingleObjectMetrics(
+        mean_center_px=float(distances.mean()) if distances.size else 0.0,
+        median_center_px=float(np.median(distances)) if distances.size else 0.0,
+        accuracy=accuracy,
+        n_images=int(distances.size),
+    )
+
+
+def _hungarian_match_pixels(
+    pred_centers_px: np.ndarray,
+    gt_centers_px: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pairwise Euclidean cost in pixels, Hungarian assignment."""
+    if pred_centers_px.size == 0 or gt_centers_px.size == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    cost = np.linalg.norm(
+        pred_centers_px[:, None, :] - gt_centers_px[None, :, :], axis=-1
+    )
+    pred_idx, gt_idx = linear_sum_assignment(cost)
+    return pred_idx, gt_idx
+
+
+def evaluate_multi_object(
+    preds: torch.Tensor,
+    gt_centers_list: list[torch.Tensor],
+    image_size: tuple[int, int],
+    gt_classes_list: list[torch.Tensor] | None = None,
+    has_classes: bool = False,
+    confidence_threshold: float = 0.5,
+    pixel_thresholds: tuple[int, ...] = DEFAULT_PIXEL_THRESHOLDS,
+) -> MultiObjectMetrics:
+    """Evaluate a multi-object center predictor on one batch.
+
+    Args:
+        preds: (B, max_objects, 3 [+ num_classes]); slot 2 is sigmoid'd conf.
+        gt_centers_list: per-image list of (num_objects_i, 2) normalized centers.
+        gt_classes_list: per-image list of (num_objects_i,) long class indices.
+    """
+    batch_size = preds.shape[0]
+    image_diag = math.hypot(image_size[0], image_size[1])
+    distances: list[float] = []
+    correct_class = 0
+    total_matched = 0
+    matched_confs: list[float] = []
+    unmatched_confs: list[float] = []
+    cardinality_err: list[int] = []
+    n_gt_total = 0
+    n_pred_total = 0
+    # Per-threshold counters for precision/recall over the whole eval set.
+    tp_at = {t: 0 for t in pixel_thresholds}
+    fp_at = {t: 0 for t in pixel_thresholds}
+    fn_at = {t: 0 for t in pixel_thresholds}
+
+    for b in range(batch_size):
+        confs = preds[b, :, 2].detach().cpu().numpy()
+        keep = confs > confidence_threshold
+        pred_centers_px = _normalized_centers_to_pixels(preds[b, :, :2], image_size)
+        kept_pred_centers = pred_centers_px[keep]
+        kept_pred_confs = confs[keep]
+        kept_pred_classes: np.ndarray | None = None
+        if has_classes and preds.shape[-1] > 3:
+            kept_pred_classes = (
+                preds[b, :, 3:].argmax(dim=-1).detach().cpu().numpy()[keep]
+            )
+
+        gt_centers = gt_centers_list[b]
+        gt_centers_px = _normalized_centers_to_pixels(gt_centers, image_size)
+        n_gt = gt_centers_px.shape[0] if gt_centers_px.ndim == 2 else 0
+        n_pred = int(keep.sum())
+        n_gt_total += n_gt
+        n_pred_total += n_pred
+        cardinality_err.append(abs(n_pred - n_gt))
+
+        unmatched_confs.extend(confs[~keep].tolist())
+
+        if n_pred == 0 or n_gt == 0:
+            for t in pixel_thresholds:
+                fp_at[t] += n_pred
+                fn_at[t] += n_gt
+            continue
+
+        pred_idx, gt_idx = _hungarian_match_pixels(kept_pred_centers, gt_centers_px)
+        if pred_idx.size == 0:
+            for t in pixel_thresholds:
+                fp_at[t] += n_pred
+                fn_at[t] += n_gt
+            continue
+
+        matched_dist = np.linalg.norm(
+            kept_pred_centers[pred_idx] - gt_centers_px[gt_idx], axis=-1
+        )
+        distances.extend(matched_dist.tolist())
+        matched_confs.extend(kept_pred_confs[pred_idx].tolist())
+        total_matched += len(pred_idx)
+
+        if has_classes and kept_pred_classes is not None and gt_classes_list is not None:
+            gt_classes = gt_classes_list[b].detach().cpu().numpy()
+            correct_class += int(
+                (kept_pred_classes[pred_idx] == gt_classes[gt_idx]).sum()
+            )
+
+        for t in pixel_thresholds:
+            tp = int((matched_dist <= t).sum())
+            tp_at[t] += tp
+            fp_at[t] += n_pred - tp
+            fn_at[t] += n_gt - tp
+
+    precision_at = {
+        t: (tp_at[t] / (tp_at[t] + fp_at[t])) if (tp_at[t] + fp_at[t]) > 0 else 0.0
+        for t in pixel_thresholds
+    }
+    recall_at = {
+        t: (tp_at[t] / (tp_at[t] + fn_at[t])) if (tp_at[t] + fn_at[t]) > 0 else 0.0
+        for t in pixel_thresholds
+    }
+    # "Center mAP" here is the average of P*R across thresholds — a single
+    # scalar that goes up only when both precision and recall improve. (This
+    # is not COCO mAP; we don't have IoUs without bboxes. Rename if/when we
+    # add bbox heads.)
+    map_center = float(np.mean([precision_at[t] * recall_at[t] for t in pixel_thresholds])) if pixel_thresholds else 0.0
+
+    # Normalized-by-diagonal mean (kept off the public dataclass for now,
+    # callers can compute from mean_matched_center_px / image_diag).
+    _ = image_diag
+
+    return MultiObjectMetrics(
+        mean_matched_center_px=float(np.mean(distances)) if distances else 0.0,
+        median_matched_center_px=float(np.median(distances)) if distances else 0.0,
+        matched_class_accuracy=(correct_class / total_matched) if total_matched > 0 else 0.0,
+        cardinality_error=float(np.mean(cardinality_err)) if cardinality_err else 0.0,
+        mean_conf_matched=float(np.mean(matched_confs)) if matched_confs else 0.0,
+        mean_conf_unmatched=float(np.mean(unmatched_confs)) if unmatched_confs else 0.0,
+        precision_at=precision_at,
+        recall_at=recall_at,
+        map_center=map_center,
+        n_images=batch_size,
+        n_gt=n_gt_total,
+        n_pred=n_pred_total,
+    )
