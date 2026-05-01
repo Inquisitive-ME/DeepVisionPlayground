@@ -31,10 +31,11 @@ from data.gpu_shapes import GpuShapeLoader
 from data.synthetic_shapes_dataset import ShapeDataset, seed_worker
 from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
+from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
-from utils.heatmap_loss import HeatmapLoss
+from utils.heatmap_loss import HeatmapLoss, MultiHeatmapLoss
 from utils.losses import CenterPredictionLoss
 from utils.metrics import evaluate_multi_object, evaluate_single_object
 from utils.perf import configure_for_speed, pick_device
@@ -66,7 +67,11 @@ class RunConfig:
 
 def parse_args() -> RunConfig:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--task", choices=("single", "multi", "heatmap"), default="single")
+    p.add_argument(
+        "--task",
+        choices=("single", "multi", "heatmap", "multi_heatmap"),
+        default="single",
+    )
     p.add_argument(
         "--encoder",
         choices=(
@@ -185,6 +190,67 @@ def evaluate_multi(model, loader, device, image_size, class_names):
     return metrics.to_dict()
 
 
+def evaluate_multi_heatmap(model, loader, device, image_size, class_names, max_objects):
+    """Decode top-K from heatmap and feed into evaluate_multi_object.
+
+    Constructs a (B, K, 3 + num_classes) tensor where slot 2 is the
+    heatmap peak score (already in [0, 1]) and the remaining channels
+    are one-hot-ish class logits — same format CenterPredictor produces.
+    """
+    model.eval()
+    num_classes = model.num_classes
+    all_outputs: list[torch.Tensor] = []
+    all_centers: list[torch.Tensor] = []
+    all_classes: list[torch.Tensor] = []
+    w, h = image_size
+    with torch.no_grad():
+        for images, anns in loader:
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
+            out = model(images)
+            dec = model.decode(out, max_objects=max_objects)
+            # Build (B, K, 3 + num_classes): cx_norm, cy_norm, conf, class_onehot.
+            B = dec.centers_px.shape[0]
+            centers_norm = dec.centers_px / torch.tensor(
+                [w, h], dtype=torch.float32, device=device,
+            )
+            class_logits = torch.zeros(
+                (B, max_objects, num_classes), dtype=torch.float32, device=device,
+            )
+            class_logits.scatter_(2, dec.class_ids.unsqueeze(-1), 5.0)
+            packed = torch.cat([
+                centers_norm,
+                dec.scores.unsqueeze(-1),
+                class_logits,
+            ], dim=-1)
+            all_outputs.append(packed.detach().cpu())
+            for ann in anns:
+                if ann:
+                    all_centers.append(torch.tensor(
+                        [o["center"] for o in ann], dtype=torch.float32,
+                    ))
+                    all_classes.append(torch.tensor(
+                        [o["shape"] for o in ann], dtype=torch.long,
+                    ))
+                else:
+                    all_centers.append(torch.zeros((0, 2), dtype=torch.float32))
+                    all_classes.append(torch.zeros((0,), dtype=torch.long))
+    if not all_outputs:
+        return {}
+    stacked = torch.cat(all_outputs, dim=0)
+    metrics = evaluate_multi_object(
+        stacked, all_centers, image_size,
+        gt_classes_list=all_classes, has_classes=True,
+        class_names=class_names,
+        # Heatmap peak scores live in [0, 1] but are typically much
+        # smaller than the CenterPredictor confidence head's outputs
+        # (focal-trained sigmoid peaks at ~0.5-0.9 even when correct).
+        # 0.1 is a sensible floor so eval metrics aren't blanked out at init.
+        confidence_threshold=0.1,
+    )
+    return metrics.to_dict()
+
+
 def evaluate_heatmap(model, loader, device, image_size):
     """Decode the heatmap output into (B, 2+num_classes) and reuse evaluate_single_object."""
     model.eval()
@@ -292,6 +358,9 @@ def main() -> None:
         train_kwargs["rotate_shapes"] = True
     else:
         train_kwargs["num_shapes_range"] = (cfg.num_shapes_min, cfg.num_shapes_max)
+    if cfg.task == "multi_heatmap":
+        # Multi heatmap shares the multi data shape (variable shapes per image).
+        train_kwargs["rotate_shapes"] = False
 
     train_seed = cfg.seed if cfg.seed != 0 else None
 
@@ -347,6 +416,8 @@ def main() -> None:
         )
     elif cfg.task == "heatmap":
         model = CenterHeatmapNet(num_classes=num_classes, stride=cfg.heatmap_stride)
+    elif cfg.task == "multi_heatmap":
+        model = MultiHeatmapNet(num_classes=num_classes, stride=cfg.heatmap_stride)
     else:
         model = CenterPredictor(
             num_classes=num_classes,
@@ -365,6 +436,7 @@ def main() -> None:
         lambda_conf=cfg.lambda_conf,
     )
     heatmap_loss_fn = HeatmapLoss(lambda_class=cfg.lambda_class)
+    multi_heatmap_loss_fn = MultiHeatmapLoss(lambda_class=cfg.lambda_class)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     run_name = f"{cfg.task}_{cfg.encoder}_{img_size[0]}_bs{cfg.batch_size}"
@@ -414,6 +486,34 @@ def main() -> None:
                     sums["hm_heatmap"] += float(terms.heatmap.detach()) * images.size(0)
                     sums["hm_offset"] += float(terms.offset.detach()) * images.size(0)
                     sums["hm_class"] += float(terms.class_.detach()) * images.size(0)
+                elif cfg.task == "multi_heatmap":
+                    w, h = img_size
+                    scale = torch.tensor([w, h], dtype=torch.float32, device=device)
+                    centers_per_image = []
+                    classes_per_image = []
+                    for ann in anns:
+                        if ann:
+                            centers_per_image.append(
+                                torch.tensor([o["center"] for o in ann],
+                                             dtype=torch.float32, device=device) * scale
+                            )
+                            classes_per_image.append(
+                                torch.tensor([o["shape"] for o in ann],
+                                             dtype=torch.long, device=device)
+                            )
+                        else:
+                            centers_per_image.append(
+                                torch.zeros((0, 2), dtype=torch.float32, device=device)
+                            )
+                            classes_per_image.append(
+                                torch.zeros((0,), dtype=torch.long, device=device)
+                            )
+                    out = model(images)
+                    terms = multi_heatmap_loss_fn(out, centers_per_image, classes_per_image)
+                    loss = terms.total
+                    sums["hm_heatmap"] += float(terms.heatmap.detach()) * images.size(0)
+                    sums["hm_offset"] += float(terms.offset.detach()) * images.size(0)
+                    sums["hm_class"] += float(terms.class_.detach()) * images.size(0)
                 else:
                     centers_list, classes_list = build_targets_multi(anns, device)
                     out = model(images)
@@ -435,7 +535,7 @@ def main() -> None:
             if cfg.task == "single":
                 logger.log_scalar("train/mse_centers", sums["mse_centers"] / max(n_train, 1), step=epoch)
                 logger.log_scalar("train/ce_class", sums["ce_class"] / max(n_train, 1), step=epoch)
-            elif cfg.task == "heatmap":
+            elif cfg.task in ("heatmap", "multi_heatmap"):
                 logger.log_scalar("train/hm_heatmap", sums["hm_heatmap"] / max(n_train, 1), step=epoch)
                 logger.log_scalar("train/hm_offset", sums["hm_offset"] / max(n_train, 1), step=epoch)
                 logger.log_scalar("train/hm_class", sums["hm_class"] / max(n_train, 1), step=epoch)
@@ -444,6 +544,10 @@ def main() -> None:
                 vm = evaluate_single(model, val_loader, device, img_size)
             elif cfg.task == "heatmap":
                 vm = evaluate_heatmap(model, val_loader, device, img_size)
+            elif cfg.task == "multi_heatmap":
+                vm = evaluate_multi_heatmap(
+                    model, val_loader, device, img_size, class_names, cfg.max_objects,
+                )
             else:
                 vm = evaluate_multi(model, val_loader, device, img_size, class_names)
             logger.log_metrics(vm, step=epoch)

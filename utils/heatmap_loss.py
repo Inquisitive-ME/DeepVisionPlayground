@@ -150,3 +150,126 @@ class HeatmapLoss(nn.Module):
         return HeatmapLossTerms(
             total=total, heatmap=heatmap_loss, offset=offset_loss, class_=class_loss,
         )
+
+
+def multi_gaussian_target(
+    centers_per_image: list[torch.Tensor],
+    out_h: int,
+    out_w: int,
+    stride: int,
+    sigma: float = 1.5,
+) -> torch.Tensor:
+    """Like gaussian_target but with one Gaussian per object and per-pixel max.
+
+    Args:
+        centers_per_image: list of length B; each entry is (N_b, 2) GT centers
+            in image pixel space. Variable N_b.
+
+    Returns:
+        (B, 1, H, W) target heatmap. For each pixel, the max over all
+        per-object Gaussians at that pixel. Lets two nearby objects each
+        be "the peak" of their own Gaussian without one cancelling the
+        other (which a sum would do).
+    """
+    B = len(centers_per_image)
+    device = centers_per_image[0].device if B > 0 else torch.device("cpu")
+    yy = torch.arange(out_h, device=device, dtype=torch.float32).view(1, out_h, 1)
+    xx = torch.arange(out_w, device=device, dtype=torch.float32).view(1, 1, out_w)
+    target = torch.zeros(B, out_h, out_w, device=device, dtype=torch.float32)
+    for b, c in enumerate(centers_per_image):
+        if c.numel() == 0:
+            continue
+        gx = (c[:, 0] / stride).round()
+        gy = (c[:, 1] / stride).round()
+        # (N, 1, 1) so broadcasting against (1, H, 1) and (1, 1, W) gives (N, H, W).
+        sq = (xx - gx.view(-1, 1, 1)) ** 2 + (yy - gy.view(-1, 1, 1)) ** 2
+        per_obj = torch.exp(-sq / (2 * sigma ** 2))
+        target[b] = per_obj.max(dim=0).values
+    return target.unsqueeze(1)  # (B, 1, H, W)
+
+
+class MultiHeatmapLoss(nn.Module):
+    """Multi-object analogue of HeatmapLoss.
+
+    Heatmap term is focal loss on the per-pixel max of all per-object
+    Gaussians. Offset and class terms are summed across every GT cell
+    (one entry per object) and normalized by total number of objects in
+    the batch.
+    """
+
+    def __init__(
+        self,
+        lambda_heatmap: float = 1.0,
+        lambda_offset: float = 1.0,
+        lambda_class: float = 1.0,
+        sigma: float = 1.5,
+    ) -> None:
+        super().__init__()
+        self.lambda_heatmap = lambda_heatmap
+        self.lambda_offset = lambda_offset
+        self.lambda_class = lambda_class
+        self.sigma = sigma
+
+    def forward(
+        self,
+        out: HeatmapOutput,
+        gt_centers_px_per_image: list[torch.Tensor],
+        gt_classes_per_image: list[torch.Tensor],
+    ) -> HeatmapLossTerms:
+        B, _, H, W = out.heatmap.shape
+        device = out.heatmap.device
+        stride = out.stride
+
+        target_hm = multi_gaussian_target(
+            gt_centers_px_per_image, H, W, stride, self.sigma,
+        )
+        heatmap_loss = focal_heatmap_loss(out.heatmap, target_hm)
+
+        # Pool all objects across the batch into flat tensors so we can
+        # compute one offset L1 and one class CE in one pass.
+        flat_b: list[int] = []
+        flat_cell_y: list[int] = []
+        flat_cell_x: list[int] = []
+        flat_target_offset: list[torch.Tensor] = []
+        flat_class: list[int] = []
+        for b, (centers, classes) in enumerate(zip(
+            gt_centers_px_per_image, gt_classes_per_image,
+        )):
+            if centers.numel() == 0:
+                continue
+            gx = centers[:, 0] / stride
+            gy = centers[:, 1] / stride
+            cx = gx.round().long().clamp(0, W - 1)
+            cy = gy.round().long().clamp(0, H - 1)
+            offsets = torch.stack(
+                [gx - cx.float() + 0.5, gy - cy.float() + 0.5], dim=-1,
+            )
+            for i in range(centers.shape[0]):
+                flat_b.append(b)
+                flat_cell_y.append(int(cy[i].item()))
+                flat_cell_x.append(int(cx[i].item()))
+                flat_target_offset.append(offsets[i])
+                flat_class.append(int(classes[i].item()))
+
+        if not flat_b:
+            offset_loss = torch.tensor(0.0, device=device)
+            class_loss = torch.tensor(0.0, device=device)
+        else:
+            b_idx = torch.tensor(flat_b, dtype=torch.long, device=device)
+            y_idx = torch.tensor(flat_cell_y, dtype=torch.long, device=device)
+            x_idx = torch.tensor(flat_cell_x, dtype=torch.long, device=device)
+            target_off = torch.stack(flat_target_offset)
+            target_cls = torch.tensor(flat_class, dtype=torch.long, device=device)
+            pred_off = out.offset[b_idx, :, y_idx, x_idx]
+            pred_cls = out.class_logits[b_idx, :, y_idx, x_idx]
+            offset_loss = F.l1_loss(pred_off, target_off)
+            class_loss = F.cross_entropy(pred_cls, target_cls)
+
+        total = (
+            self.lambda_heatmap * heatmap_loss
+            + self.lambda_offset * offset_loss
+            + self.lambda_class * class_loss
+        )
+        return HeatmapLossTerms(
+            total=total, heatmap=heatmap_loss, offset=offset_loss, class_=class_loss,
+        )
