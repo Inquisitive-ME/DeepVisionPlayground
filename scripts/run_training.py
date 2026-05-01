@@ -60,8 +60,11 @@ class RunConfig:
 def parse_args() -> RunConfig:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--task", choices=("single", "multi"), default="single")
-    p.add_argument("--encoder", choices=("simple", "simple_gap", "resnet18", "resnet34"),
-                   default="simple_gap")
+    p.add_argument(
+        "--encoder",
+        choices=("simple", "simple_bn", "simple_gap", "simple_bn_gap", "resnet18", "resnet34"),
+        default="simple_bn",
+    )
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument("--image-size", type=int, default=256)
