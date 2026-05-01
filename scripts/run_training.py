@@ -774,6 +774,16 @@ def main() -> None:
             json.dump(results, f, indent=2, default=str)
         print(f"results: {results_path}")
 
+        # Save the trained model + the config it was trained with, so
+        # scripts.eval_sweep can rebuild the model later and run it
+        # against arbitrary val configurations without retraining.
+        model_path = Path(logger.run_dir) / "model.pth"
+        torch.save(model.state_dict(), model_path)
+        config_path = Path(logger.run_dir) / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(asdict(cfg), f, indent=2, default=str)
+        print(f"model:   {model_path}")
+
         logger.log_hparams(
             {
                 "task": cfg.task, "encoder": cfg.encoder, "epochs": cfg.epochs,
