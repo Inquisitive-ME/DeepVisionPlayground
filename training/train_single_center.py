@@ -14,7 +14,10 @@ from models.encoders import EncodeType
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
 from utils.metrics import evaluate_single_object
+from utils.perf import configure_for_speed, pick_device
 from utils.training_logger import TrainingLogger
+
+configure_for_speed()
 
 VAL_SEED = 1234
 EVAL_EVERY = 1
@@ -51,6 +54,10 @@ val_dataset = ShapeDataset(
     seed=VAL_SEED,
 )
 
+device = pick_device()
+print(device)
+pin_memory = device.type == "cuda"
+
 train_loader = DataLoader(
     train_dataset,
     batch_size=100,
@@ -59,6 +66,7 @@ train_loader = DataLoader(
     num_workers=4,
     worker_init_fn=seed_worker,
     persistent_workers=True,
+    pin_memory=pin_memory,
 )
 # Val loader runs single-process so a fixed seed= on the dataset gives
 # byte-identical outputs across runs without any extra plumbing.
@@ -68,10 +76,8 @@ val_loader = DataLoader(
     shuffle=False,
     collate_fn=ShapeDataset.collate_function,
     num_workers=0,
+    pin_memory=pin_memory,
 )
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
 model_type = ModelType.center_localization_and_class_id
 model = SimpleCenterNet(
     num_classes=len(train_dataset.get_classes()),
@@ -115,7 +121,7 @@ def evaluate(model, loader, device, image_size, model_type):
     correct = 0
     with torch.no_grad():
         for images, annotations in loader:
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
             centers, classes = build_targets(annotations, device)
             outputs = model(images)
             loss = compute_loss(outputs, centers, classes, model_type)
@@ -154,7 +160,7 @@ with TrainingLogger(root="runs", run_name=run_name) as logger:
         model.train()
         running_loss = 0.0
         for images, annotations in train_loader:
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
             centers_tensor, classes_tensor = build_targets(annotations, device)
             optimizer.zero_grad()
             model_outputs = model(images)
