@@ -37,14 +37,14 @@ def _simple_stack(with_bn: bool) -> nn.Sequential:
 def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
     if encoder_type is EncodeType.simple:
         # Original 4-conv stack. Keeps spatial 16x16x128 features so a FC
-        # head can localize, but is slow to converge without BN.
-        model: nn.Module = _simple_stack(with_bn=False)
+        # head can localize. Flatten included so the encoder always emits
+        # a 2-D tensor; SimpleCenterNet's own Flatten then becomes a no-op.
+        model: nn.Module = nn.Sequential(_simple_stack(with_bn=False), nn.Flatten())
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_bn:
-        # Same stack with BatchNorm after every conv. Typically 5-10x
-        # faster to convergence than the no-BN variant on these synthetic
-        # tasks, at the cost of a tiny number of extra parameters.
-        model = _simple_stack(with_bn=True)
+        # Same stack with BatchNorm after every conv. Typically converges
+        # quicker than the no-BN variant on these synthetic tasks.
+        model = nn.Sequential(_simple_stack(with_bn=True), nn.Flatten())
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_gap:
         # GAP'd to 128 features. Removes the 8M-parameter FC head you'd

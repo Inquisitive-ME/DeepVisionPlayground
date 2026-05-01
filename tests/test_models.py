@@ -23,10 +23,13 @@ def test_encoder_output_shape(encoder_type, expected_features):
 
 
 def test_simple_encoder_keeps_spatial_dims():
+    """The simple encoder flattens at the end so it can plug into either
+    SimpleCenterNet (which then no-op-flattens again) or CenterPredictor
+    (which expects a 2-D tensor straight into its FC layers)."""
     model, sz = encoder(EncodeType.simple)
     assert sz == 128 * 16 * 16
     out = model(torch.randn(1, 3, 256, 256))
-    assert out.shape == (1, 128, 16, 16)
+    assert out.shape == (1, 128 * 16 * 16)
 
 
 def test_simple_center_net_output_shape_with_classes():
@@ -49,7 +52,9 @@ def test_simple_center_net_centers_only_mode():
     assert out.shape == (2, 2)
 
 
-def test_center_predictor_centers_and_confidence_in_unit_range():
+def test_center_predictor_confidence_in_unit_range():
+    """Confidence is sigmoided (the loss BCEs it). Centers are raw — see
+    the SimpleCenterNet sigmoid-revert commit for why; same logic here."""
     model = CenterPredictor(
         num_classes=3,
         model_type=ModelType.center_localization_and_class_id,
@@ -58,7 +63,6 @@ def test_center_predictor_centers_and_confidence_in_unit_range():
     )
     out = model(torch.randn(2, 3, 64, 64))
     assert out.shape == (2, 4, 6)  # (cx, cy, conf, 3 class logits)
-    assert (out[..., :2] >= 0).all() and (out[..., :2] <= 1).all()
     assert (out[..., 2] >= 0).all() and (out[..., 2] <= 1).all()
 
 
