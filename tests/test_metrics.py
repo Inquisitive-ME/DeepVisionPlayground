@@ -26,6 +26,30 @@ class TestSingleObject:
         m = evaluate_single_object(preds, gt, image_size=(256, 256))
         assert m.mean_center_px == pytest.approx(10.0, abs=1e-3)
 
+    def test_pearson_perfect_predictions_is_one(self):
+        preds = torch.tensor([
+            [0.2, 0.3, 1.0, 0.0, 0.0],
+            [0.4, 0.5, 0.0, 1.0, 0.0],
+            [0.7, 0.8, 0.0, 0.0, 1.0],
+        ])
+        gt = torch.tensor([[0.2, 0.3], [0.4, 0.5], [0.7, 0.8]])
+        m = evaluate_single_object(preds, gt, image_size=(256, 256))
+        assert m.pearson_cx == pytest.approx(1.0, abs=1e-6)
+        assert m.pearson_cy == pytest.approx(1.0, abs=1e-6)
+
+    def test_pearson_constant_prediction_is_zero(self):
+        """Regression to the mean: Pearson should be 0 for a constant predictor.
+
+        This is the failure mode the metric was added to expose: a model that
+        always predicts (0.5, 0.5) gets a low-ish mean_center_px (~70 on a
+        256x256 canvas) but Pearson 0, which lights it up immediately.
+        """
+        preds = torch.tensor([[0.5, 0.5, 1.0, 0.0, 0.0]] * 4)
+        gt = torch.tensor([[0.2, 0.3], [0.4, 0.5], [0.7, 0.8], [0.1, 0.9]])
+        m = evaluate_single_object(preds, gt, image_size=(256, 256))
+        assert m.pearson_cx == 0.0
+        assert m.pearson_cy == 0.0
+
 
 class TestMultiObjectGlobals:
     def test_perfect_predictions_score_full(self):

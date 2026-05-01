@@ -48,6 +48,20 @@ class TestShapeDataset:
         # Without a seed both instances default to fresh entropy.
         assert not np.array_equal(np.array(a[0][0]), np.array(b[0][0]))
 
+    def test_seeded_index_is_stable_across_calls(self, tiny_image_size):
+        """idx -> image must not drift when the dataset is re-iterated.
+
+        This used to break val: _rng advanced on every __getitem__ so epoch
+        N+1 saw different images at the same idx, hiding training progress.
+        """
+        ds = ShapeDataset(num_images=4, image_size=tiny_image_size, seed=7)
+        first = np.array(ds[2][0])
+        # Pull other indices in between to advance the underlying RNG.
+        for i in (0, 1, 3, 0):
+            _ = ds[i]
+        second = np.array(ds[2][0])
+        assert np.array_equal(first, second)
+
     def test_collate_function_shapes(self, tiny_image_size):
         ds = ShapeDataset(
             num_images=4, image_size=tiny_image_size, seed=0,
@@ -137,9 +151,34 @@ class TestAnnotationSerialization:
 
 
 class TestSeedWorker:
-    def test_workers_diverge(self, tiny_image_size):
+    def test_seeded_dataset_is_deterministic_across_workers(self, tiny_image_size):
+        """With seed set, idx -> image is deterministic regardless of worker.
+
+        This relies on the per-idx reseeding inside ShapeDataset.__getitem__,
+        so seed_worker has nothing to do here.
+        """
         ds = ShapeDataset(
             num_images=8, image_size=tiny_image_size, seed=42,
+            num_shapes_range=(1, 1), shape_outline=ShapeOutline.FILL,
+            transform=transforms.ToTensor(),
+        )
+        a = list(DataLoader(
+            ds, batch_size=2, num_workers=2, collate_fn=ShapeDataset.collate_function,
+        ))
+        b = list(DataLoader(
+            ds, batch_size=2, num_workers=0, collate_fn=ShapeDataset.collate_function,
+        ))
+        # Same indices, same images, regardless of worker count.
+        for ba, bb in zip(a, b):
+            assert torch.equal(ba[0], bb[0])
+
+    def test_unseeded_workers_diverge_with_seed_worker(self, tiny_image_size):
+        """When seed=None, each worker shares an initial RNG state.
+
+        Without seed_worker they emit duplicate images; with it they diverge.
+        """
+        ds = ShapeDataset(
+            num_images=8, image_size=tiny_image_size,
             num_shapes_range=(1, 1), shape_outline=ShapeOutline.FILL,
             transform=transforms.ToTensor(),
         )
@@ -150,8 +189,6 @@ class TestSeedWorker:
             ds, batch_size=2, num_workers=2, collate_fn=ShapeDataset.collate_function,
             worker_init_fn=seed_worker,
         ))
-        # Without seed_worker the two workers' first emissions are identical;
-        # with the hook they should diverge.
         assert torch.equal(without_init[0][0], without_init[1][0])
         assert not torch.equal(with_init[0][0], with_init[1][0])
 

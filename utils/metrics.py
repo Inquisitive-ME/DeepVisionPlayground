@@ -34,6 +34,8 @@ class SingleObjectMetrics:
     mean_center_px: float = 0.0
     median_center_px: float = 0.0
     accuracy: float = 0.0
+    pearson_cx: float = 0.0
+    pearson_cy: float = 0.0
     n_images: int = 0
 
     def to_dict(self) -> dict[str, float]:
@@ -41,6 +43,8 @@ class SingleObjectMetrics:
             "single/mean_center_px": self.mean_center_px,
             "single/median_center_px": self.median_center_px,
             "single/accuracy": self.accuracy,
+            "single/pearson_cx": self.pearson_cx,
+            "single/pearson_cy": self.pearson_cy,
         }
 
 
@@ -55,6 +59,8 @@ class MultiObjectMetrics:
     precision_at: dict[int, float] = field(default_factory=dict)
     recall_at: dict[int, float] = field(default_factory=dict)
     map_center: float = 0.0  # average over thresholds of (P*R) ... see below
+    pearson_cx: float = 0.0  # over class-agnostic Hungarian matched pairs
+    pearson_cy: float = 0.0
     # Per-class breakdowns. Keys are class indices (0..num_classes-1); the
     # outer dict for the *_at fields is keyed by pixel threshold.
     per_class_precision_at: dict[int, dict[int, float]] = field(default_factory=dict)
@@ -81,6 +87,8 @@ class MultiObjectMetrics:
             "multi/mean_conf_matched": self.mean_conf_matched,
             "multi/mean_conf_unmatched": self.mean_conf_unmatched,
             "multi/map_center": self.map_center,
+            "multi/pearson_cx": self.pearson_cx,
+            "multi/pearson_cy": self.pearson_cy,
         }
         for t, p in self.precision_at.items():
             out[f"multi/precision@{t}px"] = p
@@ -112,6 +120,17 @@ def _normalized_centers_to_pixels(
     return scaled
 
 
+def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation coefficient. Returns 0.0 when degenerate.
+
+    A constant predictor gives std=0 and corrcoef=NaN; we report 0 then so
+    TensorBoard scalars stay numeric.
+    """
+    if a.size < 2 or a.std() == 0 or b.std() == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
 def evaluate_single_object(
     preds: torch.Tensor,
     gt_centers: torch.Tensor,
@@ -125,6 +144,12 @@ def evaluate_single_object(
         preds: (B, 2 [+ num_classes]) — sigmoided centers + class logits.
         gt_centers: (B, 2) — normalized GT centers.
         gt_classes: (B,) long — GT class indices (only used if has_classes).
+
+    Reports Pearson cx / cy alongside pixel distance because that's the
+    metric that actually catches "model is regressing to the mean": a model
+    that always predicts (0.5, 0.5) gives mean_center_px around 70 px on a
+    256x256 canvas (close to the floor) AND pearson 0, where a partially
+    converged model gives something like 50 px AND pearson 0.6+.
     """
     pred_px = _normalized_centers_to_pixels(preds[:, :2], image_size)
     gt_px = _normalized_centers_to_pixels(gt_centers, image_size)
@@ -136,10 +161,15 @@ def evaluate_single_object(
         gt_class_arr = gt_classes.detach().cpu().numpy()
         accuracy = float((pred_classes == gt_class_arr).mean())
 
+    pearson_cx = _pearson(pred_px[:, 0], gt_px[:, 0])
+    pearson_cy = _pearson(pred_px[:, 1], gt_px[:, 1])
+
     return SingleObjectMetrics(
         mean_center_px=float(distances.mean()) if distances.size else 0.0,
         median_center_px=float(np.median(distances)) if distances.size else 0.0,
         accuracy=accuracy,
+        pearson_cx=pearson_cx,
+        pearson_cy=pearson_cy,
         n_images=int(distances.size),
     )
 
@@ -202,6 +232,9 @@ def evaluate_multi_object(
     matched_confs: list[float] = []
     unmatched_confs: list[float] = []
     cardinality_err: list[int] = []
+    # (pred, gt) pixel-coordinate pairs across all images, for Pearson cx/cy.
+    pearson_pairs_x: list[tuple[float, float]] = []
+    pearson_pairs_y: list[tuple[float, float]] = []
     n_gt_total = 0
     n_pred_total = 0
     # Global per-threshold counters.
@@ -275,12 +308,19 @@ def evaluate_multi_object(
                 fn_at[t] += n_gt
             continue
 
-        matched_dist = np.linalg.norm(
-            kept_pred_centers[pred_idx] - gt_centers_px[gt_idx], axis=-1
-        )
+        matched_pred_xy = kept_pred_centers[pred_idx]
+        matched_gt_xy = gt_centers_px[gt_idx]
+        matched_dist = np.linalg.norm(matched_pred_xy - matched_gt_xy, axis=-1)
         distances.extend(matched_dist.tolist())
         matched_confs.extend(kept_pred_confs[pred_idx].tolist())
         total_matched += len(pred_idx)
+        # Stash matched pairs so the loop can compute Pearson at the end
+        # over all matched predictions, not per-batch (per-batch averages
+        # of correlations don't combine cleanly).
+        for px, gx in zip(matched_pred_xy[:, 0], matched_gt_xy[:, 0]):
+            pearson_pairs_x.append((float(px), float(gx)))
+        for py, gy in zip(matched_pred_xy[:, 1], matched_gt_xy[:, 1]):
+            pearson_pairs_y.append((float(py), float(gy)))
 
         if has_classes and kept_pred_classes is not None and gt_classes_arr is not None:
             correct_class += int(
@@ -374,6 +414,16 @@ def evaluate_multi_object(
 
     _ = image_diag  # reserved for future per-image diag normalization
 
+    if pearson_pairs_x:
+        px_arr = np.array([p[0] for p in pearson_pairs_x])
+        gx_arr = np.array([p[1] for p in pearson_pairs_x])
+        py_arr = np.array([p[0] for p in pearson_pairs_y])
+        gy_arr = np.array([p[1] for p in pearson_pairs_y])
+        pearson_cx = _pearson(px_arr, gx_arr)
+        pearson_cy = _pearson(py_arr, gy_arr)
+    else:
+        pearson_cx = pearson_cy = 0.0
+
     return MultiObjectMetrics(
         mean_matched_center_px=float(np.mean(distances)) if distances else 0.0,
         median_matched_center_px=float(np.median(distances)) if distances else 0.0,
@@ -384,6 +434,8 @@ def evaluate_multi_object(
         precision_at=precision_at,
         recall_at=recall_at,
         map_center=map_center,
+        pearson_cx=pearson_cx,
+        pearson_cy=pearson_cy,
         per_class_precision_at=per_class_precision_at,
         per_class_recall_at=per_class_recall_at,
         per_class_mean_center_px=per_class_mean_center_px,

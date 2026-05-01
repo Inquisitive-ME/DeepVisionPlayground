@@ -165,6 +165,7 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
         self.save_location = save_location
         # Per-instance RNGs so a fixed seed gives a reproducible dataset even
         # when other code (or other workers) touch the global random state.
+        self._seed = seed
         self._rng = random.Random(seed)
         self._np_rng = np.random.default_rng(seed)
 
@@ -213,6 +214,16 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
         if self.fixed_dataset:
             img, ann = self.data[idx]
         else:
+            # When `seed` is set, re-derive the RNGs from `seed + idx` so the
+            # mapping idx -> image is deterministic across epochs and across
+            # processes. Without this, `_rng` advances on every call, so the
+            # same idx returns different images on the second epoch and the
+            # val set silently drifts (this was the cause of the noisy val
+            # numbers we saw — see claude_project_notes/2026-05-01_*.md).
+            if self._seed is not None:
+                per_idx_seed = (self._seed + int(idx)) & 0xFFFFFFFF
+                self._rng = random.Random(per_idx_seed)
+                self._np_rng = np.random.default_rng(per_idx_seed)
             img, ann = self.generate_image()
         if self.transform:
             img = self.transform(img)

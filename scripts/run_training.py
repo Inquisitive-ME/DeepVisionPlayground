@@ -159,28 +159,34 @@ def evaluate_multi(model, loader, device, image_size, class_names):
 
 
 def evaluate_single(model, loader, device, image_size):
+    """Pool predictions over the val set, then call evaluate_single_object once.
+
+    Aggregating per-batch averages would give a correct mean_center_px but
+    a wrong global Pearson (Pearson over batch means != Pearson over the
+    pooled population). Collecting once is much simpler and exact.
+    """
     model.eval()
-    distances_sum = 0.0
-    distances_n = 0
-    correct = 0
-    n_images = 0
+    all_preds: list[torch.Tensor] = []
+    all_centers: list[torch.Tensor] = []
+    all_classes: list[torch.Tensor] = []
     with torch.no_grad():
         for images, anns in loader:
             if images.device != device:
                 images = images.to(device, non_blocking=True)
             centers, classes = build_targets_single(anns, device)
             out = model(images)
-            batch = evaluate_single_object(
-                out, centers, image_size, gt_classes=classes, has_classes=True,
-            )
-            distances_sum += batch.mean_center_px * batch.n_images
-            distances_n += batch.n_images
-            correct += int(batch.accuracy * batch.n_images)
-            n_images += images.size(0)
-    return {
-        "single/mean_center_px": distances_sum / max(distances_n, 1),
-        "single/accuracy": correct / max(n_images, 1),
-    }
+            all_preds.append(out.detach().cpu())
+            all_centers.append(centers.detach().cpu())
+            all_classes.append(classes.detach().cpu())
+    if not all_preds:
+        return {}
+    preds = torch.cat(all_preds, dim=0)
+    centers = torch.cat(all_centers, dim=0)
+    classes = torch.cat(all_classes, dim=0)
+    metrics = evaluate_single_object(
+        preds, centers, image_size, gt_classes=classes, has_classes=True,
+    )
+    return metrics.to_dict()
 
 
 def main() -> None:
@@ -290,14 +296,22 @@ def main() -> None:
         for epoch in range(cfg.epochs):
             t0 = time.time()
             model.train()
-            running_loss = 0.0
+            # Track decomposed terms so we can see which one is moving.
+            # For multi-center we don't have a clean three-way split (the
+            # CenterPredictionLoss bundles them internally), so only
+            # single-center reports the breakdown.
+            sums = {"loss": 0.0, "mse_centers": 0.0, "ce_class": 0.0}
             for images, anns in train_loader:
                 if images.device != device:
                     images = images.to(device, non_blocking=True)
                 if cfg.task == "single":
                     centers, classes = build_targets_single(anns, device)
                     out = model(images)
-                    loss = mse(out[:, :2], centers) + F.cross_entropy(out[:, 2:], classes)
+                    mse_term = mse(out[:, :2], centers)
+                    ce_term = F.cross_entropy(out[:, 2:], classes)
+                    loss = mse_term + ce_term
+                    sums["mse_centers"] += float(mse_term.detach()) * images.size(0)
+                    sums["ce_class"] += float(ce_term.detach()) * images.size(0)
                 else:
                     centers_list, classes_list = build_targets_multi(anns, device)
                     out = model(images)
@@ -305,17 +319,20 @@ def main() -> None:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                running_loss += loss.item() * images.size(0)
+                sums["loss"] += loss.item() * images.size(0)
 
             dt = time.time() - t0
             epoch_times.append(dt)
             n_train = cfg.batch_size * len(train_loader)
-            epoch_loss = running_loss / max(n_train, 1)
+            epoch_loss = sums["loss"] / max(n_train, 1)
             ips = n_train / dt
 
             logger.log_scalar("train/loss", epoch_loss, step=epoch)
             logger.log_scalar("train/images_per_sec", ips, step=epoch)
             logger.log_scalar("train/epoch_seconds", dt, step=epoch)
+            if cfg.task == "single":
+                logger.log_scalar("train/mse_centers", sums["mse_centers"] / max(n_train, 1), step=epoch)
+                logger.log_scalar("train/ce_class", sums["ce_class"] / max(n_train, 1), step=epoch)
 
             if cfg.task == "single":
                 vm = evaluate_single(model, val_loader, device, img_size)
@@ -324,10 +341,14 @@ def main() -> None:
             logger.log_metrics(vm, step=epoch)
             final_metrics = vm
 
+            interesting_substrings = ("_px", "accuracy", "map", "pearson")
             extras = ", ".join(
                 f"{k.split('/')[-1]}={v:.3f}"
                 for k, v in vm.items()
-                if "_px" in k or "accuracy" in k or "map" in k
+                if any(s in k for s in interesting_substrings)
+                # Skip the per-class breakdown to keep the line short;
+                # those go to TensorBoard via log_metrics() above.
+                and k.count("/") <= 1
             )
             print(
                 f"epoch {epoch + 1}/{cfg.epochs} loss={epoch_loss:.4f}"
