@@ -16,3 +16,13 @@ strict_equality = true
 [[tool.mypy.overrides]]
 module = "torchvision.*"
 ignore_missing_imports = true  # Ignore missing type hints for torchvision
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    # Surfacing real warnings is more useful than chasing the noisy ones we
+    # know about (matplotlib/torch deprecations from third-party paths).
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
