@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from data.annotations import BackgroundType, ShapeOutline, ShapeType
+from data.gpu_shapes import GpuShapeLoader
 from data.synthetic_shapes_dataset import ShapeDataset, seed_worker
 from models.encoders import EncodeType
 from models.multiple_center_predictor import CenterPredictor
@@ -55,6 +56,7 @@ class RunConfig:
     seed: int
     val_seed: int
     num_workers: int
+    gpu_data: bool
 
 
 def parse_args() -> RunConfig:
@@ -81,6 +83,13 @@ def parse_args() -> RunConfig:
                    help="Train RNG seed (0 = unseeded fresh entropy)")
     p.add_argument("--val-seed", type=int, default=1234)
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument(
+        "--gpu-data", action="store_true",
+        help=(
+            "Generate batches directly on the GPU with data.gpu_shapes "
+            "instead of CPU PIL workers. Way higher GPU utilization."
+        ),
+    )
     args = p.parse_args()
 
     hd = tuple(int(x) for x in args.hidden_dims.split(",") if x) if args.hidden_dims else ()
@@ -100,6 +109,7 @@ def parse_args() -> RunConfig:
         seed=args.seed,
         val_seed=args.val_seed,
         num_workers=args.num_workers,
+        gpu_data=args.gpu_data,
     )
 
 
@@ -131,7 +141,8 @@ def evaluate_multi(model, loader, device, image_size, class_names):
     all_classes: list[torch.Tensor] = []
     with torch.no_grad():
         for images, anns in loader:
-            images = images.to(device, non_blocking=True)
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
             centers, classes = build_targets_multi(anns, device)
             out = model(images)
             all_outputs.append(out.detach().cpu())
@@ -155,7 +166,8 @@ def evaluate_single(model, loader, device, image_size):
     n_images = 0
     with torch.no_grad():
         for images, anns in loader:
-            images = images.to(device, non_blocking=True)
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
             centers, classes = build_targets_single(anns, device)
             out = model(images)
             batch = evaluate_single_object(
@@ -202,23 +214,51 @@ def main() -> None:
         train_kwargs["num_shapes_range"] = (cfg.num_shapes_min, cfg.num_shapes_max)
 
     train_seed = cfg.seed if cfg.seed != 0 else None
-    train_dataset = ShapeDataset(num_images=cfg.num_train_images, seed=train_seed, **train_kwargs)
-    val_dataset = ShapeDataset(num_images=cfg.num_val_images, seed=cfg.val_seed, **train_kwargs)
-    pin_memory = device.type == "cuda"
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=cfg.batch_size, shuffle=True,
-        collate_fn=ShapeDataset.collate_function,
-        num_workers=cfg.num_workers, worker_init_fn=seed_worker,
-        persistent_workers=cfg.num_workers > 0, pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=ShapeDataset.collate_function,
-        num_workers=0, pin_memory=pin_memory,
-    )
-
-    num_classes = len(train_dataset.get_classes())
+    if cfg.gpu_data:
+        if device.type != "cuda":
+            raise RuntimeError("--gpu-data requires CUDA")
+        if train_kwargs["background"] is not BackgroundType.SOLID:
+            raise NotImplementedError("GpuShapeLoader only supports SOLID backgrounds")
+        gpu_kwargs = dict(
+            image_size=img_size,
+            num_shapes_range=train_kwargs["num_shapes_range"],
+            shape_size_range=train_kwargs["shape_size_range"],
+            shape_types=train_kwargs["shape_types"],
+            rotate_shapes=train_kwargs["rotate_shapes"],
+            device=device,
+        )
+        train_loader: Any = GpuShapeLoader(
+            batch_size=cfg.batch_size,
+            num_images=cfg.num_train_images,
+            seed=train_seed,
+            **gpu_kwargs,
+        )
+        val_loader: Any = GpuShapeLoader(
+            batch_size=cfg.batch_size,
+            num_images=cfg.num_val_images,
+            seed=cfg.val_seed,
+            **gpu_kwargs,
+        )
+        num_classes = len(ShapeType)
+        class_names = tuple(s.name for s in ShapeType)
+    else:
+        train_dataset = ShapeDataset(num_images=cfg.num_train_images, seed=train_seed, **train_kwargs)
+        val_dataset = ShapeDataset(num_images=cfg.num_val_images, seed=cfg.val_seed, **train_kwargs)
+        pin_memory = device.type == "cuda"
+        train_loader = DataLoader(
+            train_dataset, batch_size=cfg.batch_size, shuffle=True,
+            collate_fn=ShapeDataset.collate_function,
+            num_workers=cfg.num_workers, worker_init_fn=seed_worker,
+            persistent_workers=cfg.num_workers > 0, pin_memory=pin_memory,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=cfg.batch_size, shuffle=False,
+            collate_fn=ShapeDataset.collate_function,
+            num_workers=0, pin_memory=pin_memory,
+        )
+        num_classes = len(train_dataset.get_classes())
+        class_names = tuple(train_dataset.get_classes())
     if cfg.task == "single":
         model: torch.nn.Module = SimpleCenterNet(
             num_classes=num_classes,
@@ -252,7 +292,8 @@ def main() -> None:
             model.train()
             running_loss = 0.0
             for images, anns in train_loader:
-                images = images.to(device, non_blocking=True)
+                if images.device != device:
+                    images = images.to(device, non_blocking=True)
                 if cfg.task == "single":
                     centers, classes = build_targets_single(anns, device)
                     out = model(images)
@@ -266,10 +307,11 @@ def main() -> None:
                 optimizer.step()
                 running_loss += loss.item() * images.size(0)
 
-            epoch_loss = running_loss / len(train_dataset)
             dt = time.time() - t0
             epoch_times.append(dt)
-            ips = len(train_dataset) / dt
+            n_train = cfg.batch_size * len(train_loader)
+            epoch_loss = running_loss / max(n_train, 1)
+            ips = n_train / dt
 
             logger.log_scalar("train/loss", epoch_loss, step=epoch)
             logger.log_scalar("train/images_per_sec", ips, step=epoch)
@@ -278,7 +320,7 @@ def main() -> None:
             if cfg.task == "single":
                 vm = evaluate_single(model, val_loader, device, img_size)
             else:
-                vm = evaluate_multi(model, val_loader, device, img_size, tuple(train_dataset.get_classes()))
+                vm = evaluate_multi(model, val_loader, device, img_size, class_names)
             logger.log_metrics(vm, step=epoch)
             final_metrics = vm
 

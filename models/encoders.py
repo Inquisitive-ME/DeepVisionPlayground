@@ -63,13 +63,15 @@ def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
         )
         features_out_size = 128
     elif encoder_type is EncodeType.resnet18:
-        model = models.resnet18(weights=None)
-        features_out_size = model.fc.in_features
-        model.fc = nn.Identity()
+        rn18 = models.resnet18(weights=None)
+        features_out_size = int(rn18.fc.in_features)
+        rn18.fc = nn.Identity()
+        model = rn18
     elif encoder_type is EncodeType.resnet34:
-        model = models.resnet34(weights=None)
-        features_out_size = model.fc.in_features
-        model.fc = nn.Identity()
+        rn34 = models.resnet34(weights=None)
+        features_out_size = int(rn34.fc.in_features)
+        rn34.fc = nn.Identity()
+        model = rn34
     else:
         raise ValueError(f"unknown encoder type: {encoder_type}")
 
