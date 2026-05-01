@@ -1,14 +1,8 @@
-from enum import Enum, auto
-
 import torch
 import torch.nn as nn
 
 from models.encoders import EncodeType, encoder
-
-
-class ModelType(Enum):
-    center_localization = auto()
-    center_localization_and_class_id = auto()
+from models.types import ModelType
 
 
 # Define a simple CNN that outputs two numbers (x, y center coordinates)

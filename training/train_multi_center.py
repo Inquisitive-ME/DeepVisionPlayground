@@ -10,7 +10,8 @@ from torchvision import transforms
 
 from data.annotations import BackgroundType, ShapeOutline, ShapeType
 from data.synthetic_shapes_dataset import ShapeDataset
-from models.multiple_center_predictor import CenterPredictor, ModelType
+from models.multiple_center_predictor import CenterPredictor
+from models.types import ModelType
 from utils.losses import CenterPredictionLoss
 
 # Define transformation to convert PIL images to tensors.

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from models.multiple_center_predictor import ModelType
+from models.types import ModelType
 
 
 class CenterPredictionLoss(nn.Module):

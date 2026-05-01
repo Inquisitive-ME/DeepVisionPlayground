@@ -11,7 +11,8 @@ from torchvision import transforms
 from data.annotations import BackgroundType, ShapeOutline, ShapeType
 from data.synthetic_shapes_dataset import ShapeDataset
 from models.encoders import EncodeType
-from models.simple_center_net import ModelType, SimpleCenterNet
+from models.simple_center_net import SimpleCenterNet
+from models.types import ModelType
 
 # Define transformation to convert PIL images to tensors.
 transform = transforms.ToTensor()
