@@ -1,4 +1,5 @@
 import os
+import time
 from typing import cast
 
 import matplotlib.pyplot as plt
@@ -20,7 +21,7 @@ transform = transforms.ToTensor()
 dataset = ShapeDataset(
     num_images=1000,
     image_size=(256, 256),
-    num_shapes_range=(0, 5),
+    num_shapes_range=(0, 3),
     shape_types=tuple(ShapeType),
     shape_size_range=(20, 90),
     background=BackgroundType.SOLID,
@@ -42,22 +43,24 @@ model_type = ModelType.center_localization_and_class_id
 num_classes = len(dataset.get_classes())
 save_model_path = "center_predictor.pth"
 model = CenterPredictor(num_classes=num_classes,
-                        model_type=model_type).to(device)
+                        model_type=model_type,
+                        max_objects=5,
+                        hidden_dims=[1024, 1024, 1024],
+                        ).to(device)
 if os.path.exists(save_model_path):
     print("loading model: ", save_model_path)
-    checkpoint = torch.load(save_model_path)
+    checkpoint = torch.load(save_model_path, map_location=device)
     model_state = model.state_dict()
     filtered_checkpoint = {k: v for k, v in checkpoint.items() if k in model_state and model_state[k].shape == v.shape}
     model.load_state_dict(filtered_checkpoint, strict=False)
 
-optimizer = optim.Adam(model.parameters(), lr=1e-6)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=15)
-mse_loss = torch.nn.MSELoss()
-cross_entropy_loss = torch.nn.CrossEntropyLoss(ignore_index=num_classes)
-num_epochs = 100
+optimizer = optim.Adam(model.parameters(), lr=1e-5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.6, patience=150)
+num_epochs = 10_000
 center_prediction_loss = CenterPredictionLoss(model_type=model_type)
 
 for epoch in range(num_epochs):
+    start_time = time.time()
     model.train()
     running_loss = 0.0
     for images, annotations in dataloader:
@@ -67,30 +70,21 @@ for epoch in range(num_epochs):
         object_classes_per_image = []
         centers_per_image = []
         for ann in annotations:
-            centers = []  # Centers for this specific image
-            object_classes = []
-            for obj in ann:  # Loop through all objects in the annotation
-                centers.append(obj['center'])  # Collect all centers for this image
-                object_classes.append(obj["shape"])
+            centers = [obj['center'] for obj in ann]
+            object_classes = [obj['shape'] for obj in ann]
 
-            centers_tensor = torch.tensor(centers, dtype=torch.float32).to(device)
+            if len(centers) > 0:
+                centers_tensor = torch.tensor(centers, dtype=torch.float32, device=device)
+                classes_tensor = torch.tensor(object_classes, dtype=torch.long, device=device)
+            else:
+                centers_tensor = torch.zeros((0, 2), dtype=torch.float32, device=device)
+                classes_tensor = torch.zeros((0,), dtype=torch.long, device=device)
+
             centers_per_image.append(centers_tensor)
-
-            object_classes_tensor = torch.tensor(object_classes, dtype=torch.uint8).to(device)
-            # **Padding: Ensure each tensor is max_objects long**
-            num_objects = len(object_classes)
-            max_objects = 10
-            if num_objects < max_objects:
-                # Pad object classes with padding_value
-                pad_classes = torch.full((max_objects - num_objects,), num_classes, dtype=torch.long, device=device)
-                object_classes_tensor = torch.cat((object_classes_tensor, pad_classes), dim=0)
-
-            object_classes_per_image.append(object_classes_tensor)
-        object_classes_tensor = torch.stack(object_classes_per_image)
+            object_classes_per_image.append(classes_tensor)
 
         optimizer.zero_grad()
         model_outputs = model(images)
-        center_prediction_outputs = model_outputs[:, :, :3]
         loss = center_prediction_loss(model_outputs, centers_per_image, object_classes_per_image)
 
         loss.backward()
@@ -104,7 +98,10 @@ for epoch in range(num_epochs):
     new_lr = optimizer.param_groups[0]["lr"]
     if new_lr != prev_lr:
         print(f"Learning rate reduced from {prev_lr:.8f} to {new_lr:.8f} at epoch {epoch + 1}")
-    print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+    epoch_time_s = time.time() - start_time
+    print(f"Epoch {epoch + 1}/{num_epochs},"
+          f" Loss: {epoch_loss:.4f} Time: {epoch_time_s:.2f} s,"
+          f" Remaining Time: {epoch_time_s * (num_epochs - 1 - epoch) / 60:.2f} min")
 
 print("Training complete.")
 torch.save(model.state_dict(), save_model_path)  # Save weights

@@ -42,9 +42,9 @@ dataloader = DataLoader(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 model_type = ModelType.center_localization_and_class_id
-model = SimpleCenterNet(len(dataset.get_classes()),
+model = SimpleCenterNet(num_classes=len(dataset.get_classes()),
                         model_type=model_type,
-                        encoder_type=EncodeType.simple).to(device)
+                        encoder_type=EncodeType.simple_gap).to(device)
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='min', factor=0.7, patience=15
@@ -66,10 +66,10 @@ for epoch in range(num_epochs):
             center = ann[0]['center']  # Grab the center from the first shape
             centers.append(center)
             object_classes.append(ann[0]["shape"])
-        centers_tensor = torch.tensor(centers, dtype=torch.float32).to(device)
+        centers_tensor = torch.tensor(centers, dtype=torch.float32, device=device)
         object_classes_tensor = torch.tensor(
-            object_classes, dtype=torch.uint8
-        ).to(device)
+            object_classes, dtype=torch.long, device=device
+        )
         optimizer.zero_grad()
         model_outputs = model(images)
         if model_type is ModelType.center_localization:
