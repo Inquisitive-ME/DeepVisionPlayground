@@ -10,7 +10,9 @@ class EncodeType(Enum):
     simple_gap = auto()
     simple_bn_gap = auto()
     resnet18 = auto()
+    resnet18_spatial = auto()
     resnet34 = auto()
+    resnet34_spatial = auto()
 
 
 def _simple_block(in_ch: int, out_ch: int, with_bn: bool) -> list[nn.Module]:
@@ -63,15 +65,39 @@ def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
         )
         features_out_size = 128
     elif encoder_type is EncodeType.resnet18:
+        # Standard torchvision wiring: features go through AdaptiveAvgPool2d
+        # before the fc head. We replace fc with Identity, so the encoder
+        # outputs a (B, 512) GAP'd vector. That's the right thing for image
+        # classification but POSITION-INVARIANT — i.e. cannot localize. Use
+        # resnet18_spatial for localization tasks.
         rn18 = models.resnet18(weights=None)
         features_out_size = int(rn18.fc.in_features)
         rn18.fc = nn.Identity()
         model = rn18
+    elif encoder_type is EncodeType.resnet18_spatial:
+        # ResNet18 with the final avgpool + fc stripped, so the encoder emits
+        # the (B, 512, 8, 8) feature map for 256x256 input. Flatten in the
+        # head to localize. ~32k features after flatten.
+        rn18 = models.resnet18(weights=None)
+        model = nn.Sequential(
+            rn18.conv1, rn18.bn1, rn18.relu, rn18.maxpool,
+            rn18.layer1, rn18.layer2, rn18.layer3, rn18.layer4,
+            nn.Flatten(),
+        )
+        features_out_size = 512 * 8 * 8
     elif encoder_type is EncodeType.resnet34:
         rn34 = models.resnet34(weights=None)
         features_out_size = int(rn34.fc.in_features)
         rn34.fc = nn.Identity()
         model = rn34
+    elif encoder_type is EncodeType.resnet34_spatial:
+        rn34 = models.resnet34(weights=None)
+        model = nn.Sequential(
+            rn34.conv1, rn34.bn1, rn34.relu, rn34.maxpool,
+            rn34.layer1, rn34.layer2, rn34.layer3, rn34.layer4,
+            nn.Flatten(),
+        )
+        features_out_size = 512 * 8 * 8
     else:
         raise ValueError(f"unknown encoder type: {encoder_type}")
 

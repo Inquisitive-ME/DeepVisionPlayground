@@ -64,7 +64,11 @@ def parse_args() -> RunConfig:
     p.add_argument("--task", choices=("single", "multi"), default="single")
     p.add_argument(
         "--encoder",
-        choices=("simple", "simple_bn", "simple_gap", "simple_bn_gap", "resnet18", "resnet34"),
+        choices=(
+            "simple", "simple_bn", "simple_gap", "simple_bn_gap",
+            "resnet18", "resnet18_spatial",
+            "resnet34", "resnet34_spatial",
+        ),
         default="simple_bn",
     )
     p.add_argument("--epochs", type=int, default=30)
