@@ -133,23 +133,30 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
         if self.fixed_dataset:
             images_path = os.path.join(self.save_location, "images")
             annotations_path = os.path.join(self.save_location, "annotations")
-            # Load images from saved location
             self.data = []
             if os.path.exists(images_path) and os.path.exists(annotations_path):
-                image_paths = glob.glob(os.path.join(images_path, "*.png"))
-                print("loading {} images and annotations from {}".format(
-                    len(image_paths), self.save_location))
+                image_paths = sorted(glob.glob(os.path.join(images_path, "*.png")))
+                if len(image_paths) != num_images:
+                    raise ValueError(
+                        f"Requested num_images={num_images} but found "
+                        f"{len(image_paths)} png files in {images_path}. "
+                        f"Either delete {self.save_location} to regenerate, "
+                        f"or pass num_images={len(image_paths)}."
+                    )
+                print(f"loading {len(image_paths)} images and annotations from {self.save_location}")
                 for image_file in image_paths:
-                    annotation_file = os.path.join(annotations_path,
-                                                   os.path.basename(image_file).replace(".png", ".json"))
+                    annotation_file = os.path.join(
+                        annotations_path,
+                        os.path.basename(image_file).replace(".png", ".json"),
+                    )
                     with open(annotation_file, 'r') as f:
                         annotations = json.load(f)
                     converted_annotations = [
                         Annotation.from_dict(annotation)
                         for annotation in annotations
                     ]
-                    image = Image.open(image_file).convert("RGB")
-                    image.load()
+                    with Image.open(image_file) as raw:
+                        image = raw.convert("RGB")
                     self.data.append((image, converted_annotations))
             else:
                 os.makedirs(images_path, exist_ok=True)
@@ -158,7 +165,6 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                     img, annotations = self.generate_image()
                     self.data.append((img, annotations))
                     img.save(os.path.join(images_path, f"{i}.png"))
-                    # Save to file
                     with open(os.path.join(annotations_path, f'{i}.json'), 'w') as f:
                         json.dump(annotations, f, cls=AnnotationEncoder, indent=4)
 
