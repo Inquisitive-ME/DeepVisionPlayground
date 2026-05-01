@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from data.annotations import BackgroundType, ShapeOutline, ShapeType
-from data.synthetic_shapes_dataset import ShapeDataset
+from data.synthetic_shapes_dataset import ShapeDataset, seed_worker
 from models.encoders import EncodeType
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
@@ -52,10 +52,22 @@ val_dataset = ShapeDataset(
 )
 
 train_loader = DataLoader(
-    train_dataset, batch_size=100, shuffle=True, collate_fn=ShapeDataset.collate_function,
+    train_dataset,
+    batch_size=100,
+    shuffle=True,
+    collate_fn=ShapeDataset.collate_function,
+    num_workers=4,
+    worker_init_fn=seed_worker,
+    persistent_workers=True,
 )
+# Val loader runs single-process so a fixed seed= on the dataset gives
+# byte-identical outputs across runs without any extra plumbing.
 val_loader = DataLoader(
-    val_dataset, batch_size=100, shuffle=False, collate_fn=ShapeDataset.collate_function,
+    val_dataset,
+    batch_size=100,
+    shuffle=False,
+    collate_fn=ShapeDataset.collate_function,
+    num_workers=0,
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

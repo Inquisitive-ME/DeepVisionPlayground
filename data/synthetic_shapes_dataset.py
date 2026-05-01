@@ -71,6 +71,32 @@ def is_overlapping(new_box: BoundingBox,
     )
 
 
+def seed_worker(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn`` that reseeds ShapeDataset RNGs per worker.
+
+    PyTorch already seeds ``random`` and its own RNG per worker, but it does
+    *not* seed ``numpy.random``, and our dataset keeps its own
+    ``random.Random`` and ``numpy.random.Generator`` instances so a single
+    ``seed=`` argument produces reproducible images. Without this hook, each
+    worker holds an identical copy of those RNGs after fork/spawn and ends
+    up emitting duplicate images.
+
+    Pass as ``DataLoader(..., worker_init_fn=seed_worker)`` whenever
+    ``num_workers > 0``. Determinism across runs is the user's
+    responsibility (set ``torch.manual_seed`` and/or pass a ``generator=``
+    to the DataLoader before workers spawn).
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    base_seed = int(info.seed) % (2 ** 32)
+    dataset = info.dataset
+    if hasattr(dataset, "_rng"):
+        dataset._rng = random.Random(base_seed)
+    if hasattr(dataset, "_np_rng"):
+        dataset._np_rng = np.random.default_rng(base_seed)
+
+
 def color_distance(c1: rgb_color_type, c2: rgb_color_type) -> float:
     # Euclidean distance in RGB space.
     return cast("float", sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5)
