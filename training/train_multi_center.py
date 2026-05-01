@@ -124,13 +124,21 @@ def build_targets(annotations: list[list[dict]], device: torch.device):
     return centers_per_image, classes_per_image
 
 
-def evaluate(model, loader, device, image_size, has_classes: bool):
-    """Run the held-out val set through the model and aggregate metrics
-    across all batches into a single MultiObjectMetrics."""
+def evaluate(model, loader, device, image_size, has_classes: bool, class_names=()):
+    """Run the held-out val set, then compute metrics over the full set.
+
+    Accumulating ratios like precision/recall across batches by weighted
+    average is statistically wrong (the weights you'd need are TP/FP/FN
+    counts, not images). Cheaper-to-reason-about: collect the per-image
+    outputs/targets and call ``evaluate_multi_object`` once at the end.
+    Val sets here are 200 images, so memory is not an issue.
+    """
     model.eval()
-    total = None
-    n_images = 0
     val_loss_sum = 0.0
+    n_images_total = 0
+    all_outputs: list[torch.Tensor] = []
+    all_centers: list[torch.Tensor] = []
+    all_classes: list[torch.Tensor] = []
     with torch.no_grad():
         for images, annotations in loader:
             images = images.to(device)
@@ -138,45 +146,21 @@ def evaluate(model, loader, device, image_size, has_classes: bool):
             outputs = model(images)
             val_loss = center_prediction_loss(outputs, centers, classes)
             val_loss_sum += float(val_loss) * images.size(0)
-            batch_metrics = evaluate_multi_object(
-                outputs, centers, image_size,
-                gt_classes_list=classes, has_classes=has_classes,
-            )
-            n_images += batch_metrics.n_images
-            if total is None:
-                total = batch_metrics
-            else:
-                # Weighted-by-batch aggregation. Batches are equal-sized so a
-                # simple mean is fine; storing a rolling weighted sum would
-                # be needed for variable batch sizes.
-                w_old = total.n_images
-                w_new = batch_metrics.n_images
-                total_w = w_old + w_new
-                for f in (
-                    "mean_matched_center_px", "median_matched_center_px",
-                    "matched_class_accuracy", "cardinality_error",
-                    "mean_conf_matched", "mean_conf_unmatched", "map_center",
-                ):
-                    setattr(
-                        total, f,
-                        (getattr(total, f) * w_old + getattr(batch_metrics, f) * w_new) / total_w
-                    )
-                for t in batch_metrics.precision_at:
-                    total.precision_at[t] = (
-                        total.precision_at[t] * w_old + batch_metrics.precision_at[t] * w_new
-                    ) / total_w
-                    total.recall_at[t] = (
-                        total.recall_at[t] * w_old + batch_metrics.recall_at[t] * w_new
-                    ) / total_w
-                total.n_images = total_w
-                total.n_gt += batch_metrics.n_gt
-                total.n_pred += batch_metrics.n_pred
-    if total is None:
-        total_dict = {}
-    else:
-        total_dict = total.to_dict()
-    total_dict["val/loss"] = val_loss_sum / max(n_images, 1)
-    return total_dict
+            n_images_total += images.size(0)
+            all_outputs.append(outputs.detach().cpu())
+            all_centers.extend(c.detach().cpu() for c in centers)
+            all_classes.extend(c.detach().cpu() for c in classes)
+
+    stacked = torch.cat(all_outputs, dim=0) if all_outputs else torch.empty((0, 0, 0))
+    metrics = evaluate_multi_object(
+        stacked, all_centers, image_size,
+        gt_classes_list=all_classes if all_classes else None,
+        has_classes=has_classes,
+        class_names=class_names,
+    )
+    out = metrics.to_dict()
+    out["val/loss"] = val_loss_sum / max(n_images_total, 1)
+    return out
 
 
 run_name = "train_multi_center"
@@ -225,6 +209,7 @@ with TrainingLogger(root="runs", run_name=run_name) as logger:
             val_metrics = evaluate(
                 model, val_loader, device, image_size,
                 has_classes=(model_type is ModelType.center_localization_and_class_id),
+                class_names=tuple(train_dataset.get_classes()),
             )
             logger.log_metrics(val_metrics, step=epoch)
             log_extras = (
