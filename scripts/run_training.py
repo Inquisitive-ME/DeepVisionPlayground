@@ -61,6 +61,7 @@ class RunConfig:
     gpu_data: bool
     lambda_class: float
     lambda_conf: float
+    heatmap_stride: int
 
 
 def parse_args() -> RunConfig:
@@ -106,6 +107,13 @@ def parse_args() -> RunConfig:
         "--lambda-conf", type=float, default=1.0,
         help="Multi-object loss weight on the confidence BCE.",
     )
+    p.add_argument(
+        "--heatmap-stride", type=int, default=4,
+        help=(
+            "Output stride for heatmap models. 4 = 64x64 heatmap on 256-px input, "
+            "fast and ~2-3 px median error. 2 = 128x128, sub-pixel error. 1 = 256x256."
+        ),
+    )
     args = p.parse_args()
 
     hd = tuple(int(x) for x in args.hidden_dims.split(",") if x) if args.hidden_dims else ()
@@ -128,6 +136,7 @@ def parse_args() -> RunConfig:
         gpu_data=args.gpu_data,
         lambda_class=args.lambda_class,
         lambda_conf=args.lambda_conf,
+        heatmap_stride=args.heatmap_stride,
     )
 
 
@@ -337,7 +346,7 @@ def main() -> None:
             model_type=model_type,
         )
     elif cfg.task == "heatmap":
-        model = CenterHeatmapNet(num_classes=num_classes)
+        model = CenterHeatmapNet(num_classes=num_classes, stride=cfg.heatmap_stride)
     else:
         model = CenterPredictor(
             num_classes=num_classes,

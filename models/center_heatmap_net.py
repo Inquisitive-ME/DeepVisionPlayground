@@ -5,18 +5,23 @@ one feature cell (16 px on our 16x16 backbone, 256x256 input), and
 empirically sits at ~16 px median error no matter how long we train.
 The heatmap formulation breaks past that floor:
 
-- Predict a 64x64 (stride-4) heatmap whose argmax is the center cell,
-  trained to peak at the GT location with a Gaussian target.
+- Predict a (256/stride)x(256/stride) heatmap whose argmax is the
+  center cell, trained to peak at the GT location with a Gaussian target.
 - Predict a (2,) sub-pixel offset *at* the heatmap peak, trained on the
   fractional part of the GT center.
 - Predict per-pixel class logits at the heatmap peak.
+
+Stride is configurable: stride=4 is fast (64x64 heatmap on a 256-px
+input) and converges to a few-pixel median error; stride=2 (128x128)
+gives sub-pixel error at ~2x the decoder cost; stride=1 (256x256) is
+exact but expensive.
 
 This is a faithful single-object simplification of CenterNet (Zhou et al.
 2019). Multi-object would need NMS on the heatmap; we skip that here.
 
 Inference:
     cell_idx = heatmap.argmax over (H, W)
-    pred_pixel = cell_idx * stride + offset_at_cell * stride
+    pred_pixel = (cell_idx + offset_at_cell - 0.5) * stride
     pred_class = class_logits_at_cell.argmax
 """
 from __future__ import annotations
@@ -39,50 +44,67 @@ class HeatmapOutput:
     stride: int
 
 
-class CenterHeatmapNet(nn.Module):
-    """Encoder (stride 16) + 2-step transposed-conv decoder (stride 4 output).
+def _gn(c: int) -> nn.GroupNorm:
+    """8-group GroupNorm — train/eval-safe replacement for BN on this task.
 
-    For a 256x256 input, the output heatmap is 64x64. That's a per-cell
-    coverage of 4 pixels; the offset head bridges the remaining sub-pixel.
+    BN running stats drifted on fresh-data-every-epoch training and made
+    eval predictions diverge from train; GroupNorm is per-image so the
+    two phases behave identically.
+    """
+    return nn.GroupNorm(8, c)
+
+
+class CenterHeatmapNet(nn.Module):
+    """Strided encoder + transposed-conv decoder + (heatmap, offset, class) heads.
+
+    For a 256x256 input the output heatmap is (256/stride) on each side.
+    stride=4 (default) → 64x64; stride=2 → 128x128; stride=1 → 256x256.
     """
 
-    def __init__(self, num_classes: int) -> None:
+    def __init__(self, num_classes: int, stride: int = 4) -> None:
         super().__init__()
-        # Encoder: 4 strided convs with GroupNorm (8 groups). BatchNorm
-        # was an early choice, but on this fresh-data-every-epoch task
-        # the BN running stats drifted enough that eval-mode predictions
-        # diverged from the train-mode loss. GroupNorm is per-image so
-        # train/eval behave identically.
-        def gn(c: int) -> nn.GroupNorm:
-            return nn.GroupNorm(8, c)
-
+        if stride not in (1, 2, 4, 8, 16):
+            raise ValueError(f"stride must be a power of two in 1..16, got {stride}")
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
-            gn(32), nn.ReLU(inplace=True),                                    # 128
+            _gn(32), nn.ReLU(inplace=True),                                   # 128
             nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
-            gn(64), nn.ReLU(inplace=True),                                    # 64
+            _gn(64), nn.ReLU(inplace=True),                                   # 64
             nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
-            gn(128), nn.ReLU(inplace=True),                                   # 32
+            _gn(128), nn.ReLU(inplace=True),                                  # 32
             nn.Conv2d(128, 128, 3, stride=2, padding=1, bias=False),
-            gn(128), nn.ReLU(inplace=True),                                   # 16
+            _gn(128), nn.ReLU(inplace=True),                                  # 16
         )
-        # Decoder: upsample 16->32->64 with transposed convs.
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1, bias=False),
-            gn(64), nn.ReLU(inplace=True),                                    # 32
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1, bias=False),
-            gn(32), nn.ReLU(inplace=True),                                    # 64
-        )
-        # Heads. 1x1 convs so each spatial location is treated independently.
-        self.heatmap_head = nn.Conv2d(32, 1, 1)
-        self.offset_head = nn.Conv2d(32, 2, 1)
-        self.class_head = nn.Conv2d(32, num_classes, 1)
-        # Bias the heatmap toward "no object" at init so the BCE loss
+        # The encoder produces a 16x16 feature map (stride 16). Each
+        # transposed conv halves the stride. To reach the requested
+        # output stride we add upsamples until the spatial size matches.
+        decoder_layers: list[nn.Module] = []
+        cur_channels = 128
+        # Channel schedule for upsampling stages, in order.
+        channel_schedule = [64, 32, 32, 32, 32]
+        cur_stride = 16
+        i = 0
+        while cur_stride > stride:
+            out_ch = channel_schedule[i]
+            decoder_layers.extend([
+                nn.ConvTranspose2d(cur_channels, out_ch, 4, stride=2, padding=1, bias=False),
+                _gn(out_ch),
+                nn.ReLU(inplace=True),
+            ])
+            cur_channels = out_ch
+            cur_stride //= 2
+            i += 1
+        self.decoder = nn.Sequential(*decoder_layers) if decoder_layers else nn.Identity()
+        head_in = cur_channels
+        self.heatmap_head = nn.Conv2d(head_in, 1, 1)
+        self.offset_head = nn.Conv2d(head_in, 2, 1)
+        self.class_head = nn.Conv2d(head_in, num_classes, 1)
+        # Bias the heatmap toward "no object" at init so the focal loss
         # doesn't explode the first few steps.
         if self.heatmap_head.bias is not None:
             nn.init.constant_(self.heatmap_head.bias, -2.19)  # ≈ logit(0.1)
         self.num_classes = num_classes
-        self.stride = 4
+        self.stride = stride
 
     def forward(self, x: torch.Tensor) -> HeatmapOutput:
         feat = self.encoder(x)
@@ -110,15 +132,11 @@ class CenterHeatmapNet(nn.Module):
         peak_idx = flat.argmax(dim=1)  # (B,)
         py = peak_idx // W
         px = peak_idx % W
-        # Gather offset and class at the peak.
-        # offset has shape (B, 2, H, W) — index along last two dims.
         batch_idx = torch.arange(B, device=out.heatmap.device)
         peak_offset = out.offset[batch_idx, :, py, px]  # (B, 2)
-        peak_class_logits = out.class_logits[batch_idx, :, py, px]  # (B, num_classes)
+        peak_class_logits = out.class_logits[batch_idx, :, py, px]
         class_ids = peak_class_logits.argmax(dim=-1)
-        # The training target shifts the per-cell offset by +0.5 so the
-        # sigmoid's natural midpoint corresponds to "no offset". Reverse
-        # that shift here so the decoded position lines up with image pixels.
+        # Reverse the +0.5 shift the loss applies to the offset target.
         cx_px = (px.float() + peak_offset[:, 0] - 0.5) * out.stride
         cy_px = (py.float() + peak_offset[:, 1] - 0.5) * out.stride
         centers_px = torch.stack([cx_px, cy_px], dim=-1)
