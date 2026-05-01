@@ -70,7 +70,17 @@ class CenterPredictionLoss(nn.Module):
 
             matched_pred = pred_centers[pred_indices]
             matched_target = target_centers_torch[gt_indices]
-            total_coord_loss = total_coord_loss + F.mse_loss(matched_pred, matched_target)
+            # Smooth-L1 (Huber) instead of MSE: when matching is noisy
+            # early in training a few wildly wrong pairs get matched
+            # together, and MSE squares those errors and dominates the
+            # gradient. Smooth-L1 is linear in the tail, so a wrong pair
+            # contributes a bounded gradient and the model isn't dragged
+            # toward "predict the dataset mean" as aggressively. The
+            # behavior on tight matches (within the L1/L2 transition) is
+            # the same as MSE.
+            total_coord_loss = total_coord_loss + F.smooth_l1_loss(
+                matched_pred, matched_target,
+            )
 
             if with_class and pred_classes is not None and target_classes_torch is not None:
                 matched_pred_classes = pred_classes[pred_indices]
