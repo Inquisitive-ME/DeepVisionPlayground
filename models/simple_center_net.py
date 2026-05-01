@@ -8,8 +8,13 @@ from models.types import ModelType
 class SimpleCenterNet(nn.Module):
     """Single-object center predictor: outputs (cx, cy) and optionally class logits.
 
-    Use ``EncodeType.simple_gap`` (or any ResNet) to get a flat feature vector
-    and avoid the 8M-parameter dense head that ``EncodeType.simple`` produces.
+    Centers are produced as raw regression outputs — no sigmoid. With targets
+    in [0, 1], an earlier version sigmoided the output thinking it was tidier,
+    but that strangles the gradient at init (sigmoid output near 0.5 gives
+    very small gradient on MSE for a target distribution centered near 0.5),
+    and on this synthetic-shapes task it turned a model that converged in a
+    few epochs into one that crawled to Pearson ~0.4 over 100 epochs. Raw
+    regression matches the original working config.
     """
 
     def __init__(self,
@@ -37,11 +42,4 @@ class SimpleCenterNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = self.head(x)
-        # GT centers are normalized to [0, 1]; sigmoid keeps the regression
-        # well-conditioned and removes the need to clamp at inference time.
-        if self.model_type is ModelType.center_localization_and_class_id:
-            centers = torch.sigmoid(x[..., :2])
-            class_logits = x[..., 2:]
-            return torch.cat([centers, class_logits], dim=-1)
-        return torch.sigmoid(x)
+        return self.head(x)

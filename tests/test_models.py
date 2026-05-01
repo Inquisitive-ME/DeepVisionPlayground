@@ -29,7 +29,7 @@ def test_simple_encoder_keeps_spatial_dims():
     assert out.shape == (1, 128, 16, 16)
 
 
-def test_simple_center_net_centers_in_unit_range():
+def test_simple_center_net_output_shape_with_classes():
     model = SimpleCenterNet(
         num_classes=3,
         encoder_type=EncodeType.simple_gap,
@@ -37,7 +37,6 @@ def test_simple_center_net_centers_in_unit_range():
     )
     out = model(torch.randn(2, 3, 64, 64))
     assert out.shape == (2, 5)  # 2 centers + 3 class logits
-    assert (out[..., :2] >= 0).all() and (out[..., :2] <= 1).all()
 
 
 def test_simple_center_net_centers_only_mode():
@@ -48,7 +47,6 @@ def test_simple_center_net_centers_only_mode():
     )
     out = model(torch.randn(2, 3, 64, 64))
     assert out.shape == (2, 2)
-    assert (out >= 0).all() and (out <= 1).all()
 
 
 def test_center_predictor_centers_and_confidence_in_unit_range():
