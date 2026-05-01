@@ -63,6 +63,8 @@ class RunConfig:
     lambda_class: float
     lambda_conf: float
     heatmap_stride: int
+    val_shape_counts: tuple[int, ...]
+    val_shape_sizes: tuple[tuple[int, int], ...]
 
 
 def parse_args() -> RunConfig:
@@ -119,9 +121,34 @@ def parse_args() -> RunConfig:
             "fast and ~2-3 px median error. 2 = 128x128, sub-pixel error. 1 = 256x256."
         ),
     )
+    p.add_argument(
+        "--val-shape-counts", type=str, default="",
+        help=(
+            "Optional. Comma-separated list of additional shape counts to "
+            "evaluate the trained model against (e.g. '1,3,5,10,20'). For each "
+            "count N we build a val set with num_shapes_range=(N,N) and run "
+            "the same metrics, recording the results under 'final_metrics_by_count' "
+            "in results.json. Multi-object tasks only."
+        ),
+    )
+    p.add_argument(
+        "--val-shape-sizes", type=str, default="",
+        help=(
+            "Optional. Comma-separated 'min:max' pairs to sweep shape size at "
+            "fixed count (e.g. '10:30,30:60,60:120,120:200'). For each pair we "
+            "build a val set with shape_size_range=(min,max) and num_shapes_range "
+            "matched to the training config. Recorded under 'final_metrics_by_size'."
+        ),
+    )
     args = p.parse_args()
 
     hd = tuple(int(x) for x in args.hidden_dims.split(",") if x) if args.hidden_dims else ()
+    val_shape_counts = tuple(int(x) for x in args.val_shape_counts.split(",") if x) if args.val_shape_counts else ()
+    val_shape_sizes_raw = [s for s in args.val_shape_sizes.split(",") if s] if args.val_shape_sizes else []
+    val_shape_sizes: list[tuple[int, int]] = []
+    for s in val_shape_sizes_raw:
+        lo, hi = s.split(":")
+        val_shape_sizes.append((int(lo), int(hi)))
     return RunConfig(
         task=args.task,
         encoder=args.encoder,
@@ -142,6 +169,8 @@ def parse_args() -> RunConfig:
         lambda_class=args.lambda_class,
         lambda_conf=args.lambda_conf,
         heatmap_stride=args.heatmap_stride,
+        val_shape_counts=val_shape_counts,
+        val_shape_sizes=tuple(val_shape_sizes),
     )
 
 
@@ -154,6 +183,53 @@ def _ann_size_px(o: Any) -> float:
     if hasattr(bb, "x_min"):
         return float(max(bb.x_max - bb.x_min, bb.y_max - bb.y_min))
     return float(max(bb[2] - bb[0], bb[3] - bb[1]))
+
+
+def _build_sweep_loader(
+    cfg: "RunConfig",
+    img_size: tuple[int, int],
+    device: torch.device,
+    num_shapes_range: tuple[int, int],
+    shape_size_range: tuple[int, int],
+    label: str,
+) -> Any:
+    """Build a one-off val loader at a different num_shapes / shape_size config.
+
+    Mirrors the GPU vs CPU branching of the main val_loader construction and
+    is used by the post-training sweep paths in main(). ``label`` is only
+    used for logging messages.
+    """
+    print(f"  building sweep loader for {label}")
+    if cfg.gpu_data:
+        return GpuShapeLoader(
+            batch_size=cfg.batch_size,
+            num_images=cfg.num_val_images,
+            seed=cfg.val_seed,
+            image_size=img_size,
+            num_shapes_range=num_shapes_range,
+            shape_size_range=shape_size_range,
+            shape_types=tuple(ShapeType),
+            rotate_shapes=False,
+            device=device,
+        )
+    sweep_dataset = ShapeDataset(
+        num_images=cfg.num_val_images,
+        seed=cfg.val_seed,
+        image_size=img_size,
+        num_shapes_range=num_shapes_range,
+        shape_size_range=shape_size_range,
+        shape_types=tuple(ShapeType),
+        background=BackgroundType.SOLID,
+        shape_outline=ShapeOutline.FILL,
+        rotate_shapes=False,
+        max_overlap=0.6,
+        transform=transforms.ToTensor(),
+    )
+    return DataLoader(
+        sweep_dataset, batch_size=cfg.batch_size, shuffle=False,
+        collate_fn=ShapeDataset.collate_function,
+        num_workers=0, pin_memory=device.type == "cuda",
+    )
 
 
 def build_targets_multi(annotations, device):
@@ -584,6 +660,58 @@ def main() -> None:
                 f" dt={dt:.2f}s ips={ips:.1f} | {extras}"
             )
 
+        # Optional post-training sweeps over alternate val configurations.
+        # We only support these on the multi tasks for now — single-object
+        # evaluation has no shape-count dimension to sweep along.
+        final_metrics_by_count: dict[int, dict[str, float]] = {}
+        final_metrics_by_size: dict[str, dict[str, float]] = {}
+        if cfg.task in ("multi", "multi_heatmap") and (cfg.val_shape_counts or cfg.val_shape_sizes):
+            print("\n=== Post-training sweeps ===")
+            for n in cfg.val_shape_counts:
+                sweep_loader = _build_sweep_loader(
+                    cfg, img_size, device,
+                    num_shapes_range=(n, n),
+                    shape_size_range=train_kwargs["shape_size_range"],
+                    label=f"count={n}",
+                )
+                vm_n = (
+                    evaluate_multi_heatmap(
+                        model, sweep_loader, device, img_size, class_names, cfg.max_objects,
+                    )
+                    if cfg.task == "multi_heatmap"
+                    else evaluate_multi(
+                        model, sweep_loader, device, img_size, class_names,
+                    )
+                )
+                final_metrics_by_count[n] = vm_n
+                hi = vm_n.get("multi/mean_matched_center_px", 0.0)
+                acc = vm_n.get("multi/matched_class_accuracy", 0.0)
+                pmap = vm_n.get("multi/map_center", 0.0)
+                print(f"  count={n:3d}: mean_px={hi:6.2f}  acc={acc:.3f}  map_center={pmap:.3f}")
+
+            for lo, hi in cfg.val_shape_sizes:
+                sweep_loader = _build_sweep_loader(
+                    cfg, img_size, device,
+                    num_shapes_range=train_kwargs["num_shapes_range"],
+                    shape_size_range=(lo, hi),
+                    label=f"size={lo}-{hi}",
+                )
+                vm_s = (
+                    evaluate_multi_heatmap(
+                        model, sweep_loader, device, img_size, class_names, cfg.max_objects,
+                    )
+                    if cfg.task == "multi_heatmap"
+                    else evaluate_multi(
+                        model, sweep_loader, device, img_size, class_names,
+                    )
+                )
+                key = f"{lo}-{hi}"
+                final_metrics_by_size[key] = vm_s
+                mp = vm_s.get("multi/mean_matched_center_px", 0.0)
+                acc = vm_s.get("multi/matched_class_accuracy", 0.0)
+                pmap = vm_s.get("multi/map_center", 0.0)
+                print(f"  size={key:>8s}: mean_px={mp:6.2f}  acc={acc:.3f}  map_center={pmap:.3f}")
+
         # Pad results.json with run-level summary so downstream analysis
         # doesn't need to re-parse TB events.
         results = {
@@ -596,6 +724,8 @@ def main() -> None:
             "median_epoch_s": sorted(epoch_times)[len(epoch_times) // 2] if epoch_times else 0.0,
             "mean_images_per_sec": cfg.num_train_images * len(epoch_times) / sum(epoch_times) if epoch_times else 0.0,
             "final_metrics": final_metrics,
+            "final_metrics_by_count": final_metrics_by_count,
+            "final_metrics_by_size": final_metrics_by_size,
         }
         results_path = Path(logger.run_dir) / "results.json"
         results_path.parent.mkdir(parents=True, exist_ok=True)
