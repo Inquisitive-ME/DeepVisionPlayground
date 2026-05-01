@@ -133,6 +133,16 @@ def main() -> int:
         print(render_matrix(rows))
         print()
 
+    by_overlap = results.get("final_metrics_by_overlap", {})
+    if by_overlap:
+        print("--- Cross-distribution overlap sweep (separate val sets) ---")
+        rows = [["max_overlap", *[k[1] for k in HEADLINE_KEYS]]]
+        for key in sorted(by_overlap, key=float):
+            entry = by_overlap[key]
+            rows.append([f"{key}", *[fmt(entry.get(k[0])) for k in HEADLINE_KEYS]])
+        print(render_matrix(rows))
+        print()
+
     if args.csv:
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)

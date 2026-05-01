@@ -65,6 +65,7 @@ class RunConfig:
     heatmap_stride: int
     val_shape_counts: tuple[int, ...]
     val_shape_sizes: tuple[tuple[int, int], ...]
+    val_overlaps: tuple[float, ...]
 
 
 def parse_args() -> RunConfig:
@@ -140,6 +141,15 @@ def parse_args() -> RunConfig:
             "matched to the training config. Recorded under 'final_metrics_by_size'."
         ),
     )
+    p.add_argument(
+        "--val-overlaps", type=str, default="",
+        help=(
+            "Optional. Comma-separated max_overlap floats (e.g. '0.1,0.3,0.6,0.9'). "
+            "Builds a val set per overlap level and tests whether NMS collapses "
+            "nearby shapes into one detection. Recorded under "
+            "'final_metrics_by_overlap'."
+        ),
+    )
     args = p.parse_args()
 
     hd = tuple(int(x) for x in args.hidden_dims.split(",") if x) if args.hidden_dims else ()
@@ -149,6 +159,7 @@ def parse_args() -> RunConfig:
     for s in val_shape_sizes_raw:
         lo, hi = s.split(":")
         val_shape_sizes.append((int(lo), int(hi)))
+    val_overlaps = tuple(float(x) for x in args.val_overlaps.split(",") if x) if args.val_overlaps else ()
     return RunConfig(
         task=args.task,
         encoder=args.encoder,
@@ -171,6 +182,7 @@ def parse_args() -> RunConfig:
         heatmap_stride=args.heatmap_stride,
         val_shape_counts=val_shape_counts,
         val_shape_sizes=tuple(val_shape_sizes),
+        val_overlaps=val_overlaps,
     )
 
 
@@ -192,15 +204,19 @@ def _build_sweep_loader(
     num_shapes_range: tuple[int, int],
     shape_size_range: tuple[int, int],
     label: str,
+    max_overlap: float = 0.6,
 ) -> Any:
-    """Build a one-off val loader at a different num_shapes / shape_size config.
+    """Build a one-off val loader at a different num_shapes / shape_size /
+    max_overlap config.
 
-    Mirrors the GPU vs CPU branching of the main val_loader construction and
-    is used by the post-training sweep paths in main(). ``label`` is only
-    used for logging messages.
+    The GPU loader doesn't currently support max_overlap (it doesn't know
+    about overlap suppression at all), so overlap sweeps automatically fall
+    back to the CPU dataset path even when --gpu-data is set. CPU is fine
+    here because the val pass is small and one-shot.
     """
     print(f"  building sweep loader for {label}")
-    if cfg.gpu_data:
+    use_cpu_for_overlap = max_overlap != 0.6
+    if cfg.gpu_data and not use_cpu_for_overlap:
         return GpuShapeLoader(
             batch_size=cfg.batch_size,
             num_images=cfg.num_val_images,
@@ -222,7 +238,7 @@ def _build_sweep_loader(
         background=BackgroundType.SOLID,
         shape_outline=ShapeOutline.FILL,
         rotate_shapes=False,
-        max_overlap=0.6,
+        max_overlap=max_overlap,
         transform=transforms.ToTensor(),
     )
     return DataLoader(
@@ -665,7 +681,8 @@ def main() -> None:
         # evaluation has no shape-count dimension to sweep along.
         final_metrics_by_count: dict[int, dict[str, float]] = {}
         final_metrics_by_size: dict[str, dict[str, float]] = {}
-        if cfg.task in ("multi", "multi_heatmap") and (cfg.val_shape_counts or cfg.val_shape_sizes):
+        final_metrics_by_overlap: dict[str, dict[str, float]] = {}
+        if cfg.task in ("multi", "multi_heatmap") and (cfg.val_shape_counts or cfg.val_shape_sizes or cfg.val_overlaps):
             print("\n=== Post-training sweeps ===")
             for n in cfg.val_shape_counts:
                 sweep_loader = _build_sweep_loader(
@@ -712,6 +729,29 @@ def main() -> None:
                 pmap = vm_s.get("multi/map_center", 0.0)
                 print(f"  size={key:>8s}: mean_px={mp:6.2f}  acc={acc:.3f}  map_center={pmap:.3f}")
 
+            for ov in cfg.val_overlaps:
+                sweep_loader = _build_sweep_loader(
+                    cfg, img_size, device,
+                    num_shapes_range=train_kwargs["num_shapes_range"],
+                    shape_size_range=train_kwargs["shape_size_range"],
+                    label=f"overlap={ov:.2f}",
+                    max_overlap=ov,
+                )
+                vm_o = (
+                    evaluate_multi_heatmap(
+                        model, sweep_loader, device, img_size, class_names, cfg.max_objects,
+                    )
+                    if cfg.task == "multi_heatmap"
+                    else evaluate_multi(
+                        model, sweep_loader, device, img_size, class_names,
+                    )
+                )
+                final_metrics_by_overlap[f"{ov:.2f}"] = vm_o
+                mp = vm_o.get("multi/mean_matched_center_px", 0.0)
+                acc = vm_o.get("multi/matched_class_accuracy", 0.0)
+                pmap = vm_o.get("multi/map_center", 0.0)
+                print(f"  overlap={ov:.2f}: mean_px={mp:6.2f}  acc={acc:.3f}  map_center={pmap:.3f}")
+
         # Pad results.json with run-level summary so downstream analysis
         # doesn't need to re-parse TB events.
         results = {
@@ -726,6 +766,7 @@ def main() -> None:
             "final_metrics": final_metrics,
             "final_metrics_by_count": final_metrics_by_count,
             "final_metrics_by_size": final_metrics_by_size,
+            "final_metrics_by_overlap": final_metrics_by_overlap,
         }
         results_path = Path(logger.run_dir) / "results.json"
         results_path.parent.mkdir(parents=True, exist_ok=True)
