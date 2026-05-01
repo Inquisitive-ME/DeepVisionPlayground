@@ -159,3 +159,68 @@ class TestMultiObjectPerClass:
         assert metrics.per_class_n_gt == {0: 1, 1: 1, 2: 1}
         # After conf-threshold: img0 keeps 2 (RECT, TRI), img1 keeps 2 (TRI, RECT).
         assert metrics.per_class_n_pred == {0: 2, 1: 0, 2: 2}
+
+
+class TestSizeAndCountBuckets:
+    """Bucketed metrics let us see "where the model fails" at a glance.
+
+    Build a batch with two GTs of distinct sizes and confirm the recall
+    of the small one is 100% (we pair it with a co-located prediction)
+    while the large one is 0% (the matching prediction is far off).
+    """
+
+    def test_size_buckets_route_correctly(self):
+        preds = torch.tensor([[
+            [0.50, 0.50, 0.9, 5.0, 0.0, 0.0],   # near GT0 (small)
+            [0.10, 0.10, 0.9, 0.0, 5.0, 0.0],   # far from GT1 (large)
+        ]])
+        gt_centers = [torch.tensor([[0.50, 0.50], [0.30, 0.70]])]
+        gt_classes = [torch.tensor([0, 1])]
+        # Sizes: 25 px (small bucket "xs") and 100 px (medium bucket "md").
+        gt_sizes = [torch.tensor([25.0, 100.0])]
+
+        m = evaluate_multi_object(
+            preds, gt_centers, image_size=(256, 256),
+            gt_classes_list=gt_classes, has_classes=True,
+            gt_sizes_list=gt_sizes,
+        )
+        # The small GT got matched within 4 px → recall@4=1.0 in xs bucket.
+        assert m.by_size_recall_at["xs"][4] == pytest.approx(1.0)
+        # The medium GT was matched far away → recall@4=0 in md bucket.
+        assert m.by_size_recall_at["md"][4] == pytest.approx(0.0)
+        # n_gt counts route correctly.
+        assert m.by_size_n_gt["xs"] == 1
+        assert m.by_size_n_gt["md"] == 1
+        assert m.by_size_n_gt["sm"] == 0
+
+    def test_count_buckets_route_correctly(self):
+        # Two images, one with 2 GTs (n2 bucket), one with 4 GTs (n3-5 bucket).
+        preds = torch.tensor([
+            [
+                [0.5, 0.5, 0.9, 5.0, 0.0, 0.0],
+                [0.3, 0.7, 0.9, 0.0, 5.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            [
+                [0.1, 0.1, 0.9, 5.0, 0.0, 0.0],
+                [0.3, 0.3, 0.9, 0.0, 5.0, 0.0],
+                [0.5, 0.5, 0.9, 0.0, 0.0, 5.0],
+                [0.7, 0.7, 0.9, 5.0, 0.0, 0.0],
+            ],
+        ])
+        gt_centers = [
+            torch.tensor([[0.5, 0.5], [0.3, 0.7]]),
+            torch.tensor([[0.1, 0.1], [0.3, 0.3], [0.5, 0.5], [0.7, 0.7]]),
+        ]
+        gt_classes = [torch.tensor([0, 1]), torch.tensor([0, 1, 2, 0])]
+        m = evaluate_multi_object(
+            preds, gt_centers, image_size=(256, 256),
+            gt_classes_list=gt_classes, has_classes=True,
+        )
+        assert m.by_count_n_gt["n2"] == 2
+        assert m.by_count_n_gt["n3-5"] == 4
+        # Both images had near-perfect predictions, so recall@4 in both
+        # populated buckets should be 1.
+        assert m.by_count_recall_at["n2"][4] == pytest.approx(1.0)
+        assert m.by_count_recall_at["n3-5"][4] == pytest.approx(1.0)

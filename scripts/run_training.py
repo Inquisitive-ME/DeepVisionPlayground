@@ -145,16 +145,29 @@ def parse_args() -> RunConfig:
     )
 
 
+def _ann_size_px(o: Any) -> float:
+    """Extract a single 'size' scalar (max of width / height in pixels) from
+    one annotation dict. ``bbox`` is a 4-tuple ``(x_min, y_min, x_max, y_max)``
+    in pixel coordinates, regardless of whether it came from the CPU or GPU
+    dataset path."""
+    bb = o["bbox"]
+    if hasattr(bb, "x_min"):
+        return float(max(bb.x_max - bb.x_min, bb.y_max - bb.y_min))
+    return float(max(bb[2] - bb[0], bb[3] - bb[1]))
+
+
 def build_targets_multi(annotations, device):
-    centers, classes = [], []
+    centers, classes, sizes = [], [], []
     for ann in annotations:
         if ann:
             centers.append(torch.tensor([o["center"] for o in ann], dtype=torch.float32, device=device))
             classes.append(torch.tensor([o["shape"] for o in ann], dtype=torch.long, device=device))
+            sizes.append(torch.tensor([_ann_size_px(o) for o in ann], dtype=torch.float32, device=device))
         else:
             centers.append(torch.zeros((0, 2), dtype=torch.float32, device=device))
             classes.append(torch.zeros((0,), dtype=torch.long, device=device))
-    return centers, classes
+            sizes.append(torch.zeros((0,), dtype=torch.float32, device=device))
+    return centers, classes, sizes
 
 
 def build_targets_single(annotations, device):
@@ -171,21 +184,24 @@ def evaluate_multi(model, loader, device, image_size, class_names):
     all_outputs: list[torch.Tensor] = []
     all_centers: list[torch.Tensor] = []
     all_classes: list[torch.Tensor] = []
+    all_sizes: list[torch.Tensor] = []
     with torch.no_grad():
         for images, anns in loader:
             if images.device != device:
                 images = images.to(device, non_blocking=True)
-            centers, classes = build_targets_multi(anns, device)
+            centers, classes, sizes = build_targets_multi(anns, device)
             out = model(images)
             all_outputs.append(out.detach().cpu())
             all_centers.extend(c.detach().cpu() for c in centers)
             all_classes.extend(c.detach().cpu() for c in classes)
+            all_sizes.extend(s.detach().cpu() for s in sizes)
     stacked = torch.cat(all_outputs, dim=0) if all_outputs else torch.empty((0, 0, 0))
     metrics = evaluate_multi_object(
         stacked, all_centers, image_size,
         gt_classes_list=all_classes if all_classes else None,
         has_classes=True,
         class_names=class_names,
+        gt_sizes_list=all_sizes if all_sizes else None,
     )
     return metrics.to_dict()
 
@@ -202,6 +218,7 @@ def evaluate_multi_heatmap(model, loader, device, image_size, class_names, max_o
     all_outputs: list[torch.Tensor] = []
     all_centers: list[torch.Tensor] = []
     all_classes: list[torch.Tensor] = []
+    all_sizes: list[torch.Tensor] = []
     w, h = image_size
     with torch.no_grad():
         for images, anns in loader:
@@ -209,7 +226,6 @@ def evaluate_multi_heatmap(model, loader, device, image_size, class_names, max_o
                 images = images.to(device, non_blocking=True)
             out = model(images)
             dec = model.decode(out, max_objects=max_objects)
-            # Build (B, K, 3 + num_classes): cx_norm, cy_norm, conf, class_onehot.
             B = dec.centers_px.shape[0]
             centers_norm = dec.centers_px / torch.tensor(
                 [w, h], dtype=torch.float32, device=device,
@@ -232,9 +248,13 @@ def evaluate_multi_heatmap(model, loader, device, image_size, class_names, max_o
                     all_classes.append(torch.tensor(
                         [o["shape"] for o in ann], dtype=torch.long,
                     ))
+                    all_sizes.append(torch.tensor(
+                        [_ann_size_px(o) for o in ann], dtype=torch.float32,
+                    ))
                 else:
                     all_centers.append(torch.zeros((0, 2), dtype=torch.float32))
                     all_classes.append(torch.zeros((0,), dtype=torch.long))
+                    all_sizes.append(torch.zeros((0,), dtype=torch.float32))
     if not all_outputs:
         return {}
     stacked = torch.cat(all_outputs, dim=0)
@@ -242,10 +262,7 @@ def evaluate_multi_heatmap(model, loader, device, image_size, class_names, max_o
         stacked, all_centers, image_size,
         gt_classes_list=all_classes, has_classes=True,
         class_names=class_names,
-        # Heatmap peak scores live in [0, 1] but are typically much
-        # smaller than the CenterPredictor confidence head's outputs
-        # (focal-trained sigmoid peaks at ~0.5-0.9 even when correct).
-        # 0.1 is a sensible floor so eval metrics aren't blanked out at init.
+        gt_sizes_list=all_sizes,
         confidence_threshold=0.1,
     )
     return metrics.to_dict()
@@ -515,7 +532,7 @@ def main() -> None:
                     sums["hm_offset"] += float(terms.offset.detach()) * images.size(0)
                     sums["hm_class"] += float(terms.class_.detach()) * images.size(0)
                 else:
-                    centers_list, classes_list = build_targets_multi(anns, device)
+                    centers_list, classes_list, _ = build_targets_multi(anns, device)
                     out = model(images)
                     loss = multi_loss(out, centers_list, classes_list)
                 optimizer.zero_grad()

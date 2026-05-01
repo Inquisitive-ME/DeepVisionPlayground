@@ -28,6 +28,30 @@ from scipy.optimize import linear_sum_assignment
 
 DEFAULT_PIXEL_THRESHOLDS: tuple[int, ...] = (2, 4, 8, 16)
 
+# Size buckets in pixels for "shape size" — matched against
+# max(bbox_w, bbox_h). Anything larger than the last bucket falls into "huge".
+DEFAULT_SIZE_BUCKETS: tuple[tuple[int, int], ...] = (
+    (0, 30), (30, 60), (60, 120), (120, 1_000_000),
+)
+# Bucket label for each size bucket; aligned with DEFAULT_SIZE_BUCKETS.
+DEFAULT_SIZE_BUCKET_NAMES: tuple[str, ...] = ("xs", "sm", "md", "lg")
+
+# Bucket boundaries for "num GT objects in this image."
+DEFAULT_COUNT_BUCKETS: tuple[tuple[int, int], ...] = (
+    (0, 1), (1, 2), (2, 3), (3, 6), (6, 11), (11, 21), (21, 1_000_000),
+)
+DEFAULT_COUNT_BUCKET_NAMES: tuple[str, ...] = (
+    "n0", "n1", "n2", "n3-5", "n6-10", "n11-20", "n21+",
+)
+
+
+def _which_bucket(value: float, buckets: tuple[tuple[int, int], ...]) -> int:
+    """Return the index of the half-open bucket containing value, or len(buckets) if none."""
+    for i, (lo, hi) in enumerate(buckets):
+        if lo <= value < hi:
+            return i
+    return len(buckets)
+
 
 @dataclass
 class SingleObjectMetrics:
@@ -69,6 +93,16 @@ class MultiObjectMetrics:
     per_class_n_gt: dict[int, int] = field(default_factory=dict)
     per_class_n_pred: dict[int, int] = field(default_factory=dict)
     class_names: tuple[str, ...] = ()
+    # Per-size-bucket and per-num-objects-bucket breakdowns. Keys are
+    # bucket names (e.g. "xs", "n3-5"); values are the per-bucket
+    # mean center pixel error and recall at each pixel threshold over
+    # only the GT objects in that bucket.
+    by_size_mean_center_px: dict[str, float] = field(default_factory=dict)
+    by_size_recall_at: dict[str, dict[int, float]] = field(default_factory=dict)
+    by_size_n_gt: dict[str, int] = field(default_factory=dict)
+    by_count_mean_center_px: dict[str, float] = field(default_factory=dict)
+    by_count_recall_at: dict[str, dict[int, float]] = field(default_factory=dict)
+    by_count_n_gt: dict[str, int] = field(default_factory=dict)
     n_images: int = 0
     n_gt: int = 0
     n_pred: int = 0
@@ -105,6 +139,20 @@ class MultiObjectMetrics:
         for c, d in self.per_class_mean_center_px.items():
             tag = self._class_tag(c)
             out[f"multi/{tag}/mean_center_px"] = d
+        for tag, d in self.by_size_mean_center_px.items():
+            out[f"multi/by_size/{tag}/mean_center_px"] = d
+        for tag, by_t in self.by_size_recall_at.items():
+            for t, r in by_t.items():
+                out[f"multi/by_size/{tag}/recall@{t}px"] = r
+        for tag, n in self.by_size_n_gt.items():
+            out[f"multi/by_size/{tag}/n_gt"] = float(n)
+        for tag, d in self.by_count_mean_center_px.items():
+            out[f"multi/by_count/{tag}/mean_center_px"] = d
+        for tag, by_t in self.by_count_recall_at.items():
+            for t, r in by_t.items():
+                out[f"multi/by_count/{tag}/recall@{t}px"] = r
+        for tag, n in self.by_count_n_gt.items():
+            out[f"multi/by_count/{tag}/n_gt"] = float(n)
         return out
 
 
@@ -198,6 +246,11 @@ def evaluate_multi_object(
     pixel_thresholds: tuple[int, ...] = DEFAULT_PIXEL_THRESHOLDS,
     num_classes: int | None = None,
     class_names: tuple[str, ...] = (),
+    gt_sizes_list: list[torch.Tensor] | None = None,
+    size_buckets: tuple[tuple[int, int], ...] = DEFAULT_SIZE_BUCKETS,
+    size_bucket_names: tuple[str, ...] = DEFAULT_SIZE_BUCKET_NAMES,
+    count_buckets: tuple[tuple[int, int], ...] = DEFAULT_COUNT_BUCKETS,
+    count_bucket_names: tuple[str, ...] = DEFAULT_COUNT_BUCKET_NAMES,
 ) -> MultiObjectMetrics:
     """Evaluate a multi-object center predictor on one batch.
 
@@ -250,6 +303,16 @@ def evaluate_multi_object(
     pc_n_gt: dict[int, int] = {c: 0 for c in classes}
     pc_n_pred: dict[int, int] = {c: 0 for c in classes}
 
+    # Per-bucket counters: shape size and num-objects-per-image.
+    n_size_buckets = len(size_bucket_names)
+    n_count_buckets = len(count_bucket_names)
+    size_distances: list[list[float]] = [[] for _ in range(n_size_buckets)]
+    size_tp_at: list[dict[int, int]] = [{t: 0 for t in pixel_thresholds} for _ in range(n_size_buckets)]
+    size_n_gt_arr: list[int] = [0] * n_size_buckets
+    count_distances: list[list[float]] = [[] for _ in range(n_count_buckets)]
+    count_tp_at: list[dict[int, int]] = [{t: 0 for t in pixel_thresholds} for _ in range(n_count_buckets)]
+    count_n_gt_arr: list[int] = [0] * n_count_buckets
+
     for b in range(batch_size):
         confs = preds[b, :, 2].detach().cpu().numpy()
         keep = confs > confidence_threshold
@@ -269,6 +332,24 @@ def evaluate_multi_object(
         n_gt_total += n_gt
         n_pred_total += n_pred
         cardinality_err.append(abs(n_pred - n_gt))
+
+        # Bucket assignments for this image's GTs. size bucket is per-GT;
+        # count bucket is per-image (everyone in this image shares it).
+        gt_sizes_arr: np.ndarray | None = None
+        if gt_sizes_list is not None and b < len(gt_sizes_list):
+            gt_sizes_arr = gt_sizes_list[b].detach().cpu().numpy()
+        size_bucket_per_gt = (
+            [
+                min(_which_bucket(float(gt_sizes_arr[i]), size_buckets), n_size_buckets - 1)
+                for i in range(n_gt)
+            ]
+            if gt_sizes_arr is not None and n_gt > 0
+            else [0] * n_gt
+        )
+        count_bucket = min(_which_bucket(n_gt, count_buckets), n_count_buckets - 1)
+        for sb in size_bucket_per_gt:
+            size_n_gt_arr[sb] += 1
+        count_n_gt_arr[count_bucket] += n_gt
 
         unmatched_confs.extend(confs[~keep].tolist())
 
@@ -333,6 +414,17 @@ def evaluate_multi_object(
             tp_at[t] += tp
             fp_at[t] += n_pred - tp
             fn_at[t] += n_gt - tp
+
+        # Bucketed TP and distance pools for each matched GT.
+        for k, gi in enumerate(gt_idx.tolist()):
+            sb = size_bucket_per_gt[gi]
+            d = float(matched_dist[k])
+            size_distances[sb].append(d)
+            count_distances[count_bucket].append(d)
+            for t in pixel_thresholds:
+                if d <= t:
+                    size_tp_at[sb][t] += 1
+                    count_tp_at[count_bucket][t] += 1
 
         # Per-class TP/FP/FN by threshold. A match counts as TP[c] only when
         # both classes equal c AND distance <= threshold; otherwise the
@@ -414,6 +506,32 @@ def evaluate_multi_object(
 
     _ = image_diag  # reserved for future per-image diag normalization
 
+    by_size_mean_center_px: dict[str, float] = {}
+    by_size_recall_at: dict[str, dict[int, float]] = {}
+    by_size_n_gt: dict[str, int] = {}
+    for i, name in enumerate(size_bucket_names):
+        by_size_n_gt[name] = size_n_gt_arr[i]
+        by_size_mean_center_px[name] = (
+            float(np.mean(size_distances[i])) if size_distances[i] else 0.0
+        )
+        by_size_recall_at[name] = {
+            t: (size_tp_at[i][t] / size_n_gt_arr[i]) if size_n_gt_arr[i] > 0 else 0.0
+            for t in pixel_thresholds
+        }
+
+    by_count_mean_center_px: dict[str, float] = {}
+    by_count_recall_at: dict[str, dict[int, float]] = {}
+    by_count_n_gt: dict[str, int] = {}
+    for i, name in enumerate(count_bucket_names):
+        by_count_n_gt[name] = count_n_gt_arr[i]
+        by_count_mean_center_px[name] = (
+            float(np.mean(count_distances[i])) if count_distances[i] else 0.0
+        )
+        by_count_recall_at[name] = {
+            t: (count_tp_at[i][t] / count_n_gt_arr[i]) if count_n_gt_arr[i] > 0 else 0.0
+            for t in pixel_thresholds
+        }
+
     if pearson_pairs_x:
         px_arr = np.array([p[0] for p in pearson_pairs_x])
         gx_arr = np.array([p[1] for p in pearson_pairs_x])
@@ -442,6 +560,12 @@ def evaluate_multi_object(
         per_class_n_gt=pc_n_gt,
         per_class_n_pred=pc_n_pred,
         class_names=class_names,
+        by_size_mean_center_px=by_size_mean_center_px,
+        by_size_recall_at=by_size_recall_at,
+        by_size_n_gt=by_size_n_gt,
+        by_count_mean_center_px=by_count_mean_center_px,
+        by_count_recall_at=by_count_recall_at,
+        by_count_n_gt=by_count_n_gt,
         n_images=batch_size,
         n_gt=n_gt_total,
         n_pred=n_pred_total,
