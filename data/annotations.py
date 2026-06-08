@@ -1,10 +1,38 @@
 import json
 import random
+import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import NamedTuple, Tuple
 
 from typing_extensions import Self
+
+
+def validate_shape_size_range(
+    image_size: tuple[int, int], shape_size_range: tuple[int, int]
+) -> None:
+    """Check a shape_size_range fits the canvas.
+
+    Shapes are clamped to at most half the image (``min(w, h) // 2``). If the
+    requested minimum exceeds that, no shape can be placed and the sampler
+    would otherwise crash with a confusing ``randrange`` error — so raise a
+    clear error. If only the maximum exceeds it, warn that the upper bound is
+    silently capped (so a size-distribution sweep isn't quietly truncated).
+    """
+    w, h = image_size
+    cap = min(w, h) // 2
+    lo, hi = shape_size_range
+    if lo > cap:
+        raise ValueError(
+            f"shape_size_range minimum {lo} exceeds image//2={cap} for "
+            f"image_size={image_size}; no shape can fit. Lower the size or raise image_size."
+        )
+    if hi > cap:
+        warnings.warn(
+            f"shape_size_range maximum {hi} is capped to image//2={cap} for "
+            f"image_size={image_size}; sizes above {cap} will not appear.",
+            stacklevel=2,
+        )
 
 
 class BoundingBox(NamedTuple):

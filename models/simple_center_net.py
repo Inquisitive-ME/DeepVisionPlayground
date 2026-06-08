@@ -1,42 +1,45 @@
-from enum import Enum, auto
-
 import torch
 import torch.nn as nn
 
 from models.encoders import EncodeType, encoder
+from models.types import ModelType
 
 
-class ModelType(Enum):
-    center_localization = auto()
-    center_localization_and_class_id = auto()
-
-
-# Define a simple CNN that outputs two numbers (x, y center coordinates)
 class SimpleCenterNet(nn.Module):
+    """Single-object center predictor: outputs (cx, cy) and optionally class logits.
+
+    Centers are produced as raw regression outputs — no sigmoid. With targets
+    in [0, 1], an earlier version sigmoided the output thinking it was tidier,
+    but that strangles the gradient at init (sigmoid output near 0.5 gives
+    very small gradient on MSE for a target distribution centered near 0.5),
+    and on this synthetic-shapes task it turned a model that converged in a
+    few epochs into one that crawled to Pearson ~0.4 over 100 epochs. Raw
+    regression matches the original working config.
+    """
+
     def __init__(self,
-                 num_objects: int,
+                 num_classes: int,
                  encoder_type: EncodeType,
                  model_type: ModelType) -> None:
-        super(SimpleCenterNet, self).__init__()
+        super().__init__()
+        self.model_type = model_type
         self.features, features_out_size = encoder(encoder_type)
-
-        self.flatten = nn.Flatten()
 
         if model_type is ModelType.center_localization:
             output_size = 2
         elif model_type is ModelType.center_localization_and_class_id:
-            output_size = 2 + num_objects
+            output_size = 2 + num_classes
         else:
-            assert False, "unknown encoder type"
-        self.fc = nn.Sequential(
+            raise ValueError(f"unknown model type: {model_type}")
+
+        self.head = nn.Sequential(
+            nn.Flatten(),
             nn.Linear(features_out_size, 256),
             nn.ReLU(),
-            # Predict x, y coordinates, and one hot encoded label
-            nn.Linear(256, output_size)
+            nn.Linear(256, output_size),
         )
+        self.num_classes = num_classes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = self.flatten(x)
-        x = self.fc(x)
-        return x
+        return self.head(x)
