@@ -14,7 +14,15 @@ from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 from torch.utils.data._utils.collate import default_collate
 
-from data.annotations import Annotation, AnnotationEncoder, BackgroundType, BoundingBox, ShapeOutline, ShapeType
+from data.annotations import (
+    Annotation,
+    AnnotationEncoder,
+    BackgroundType,
+    BoundingBox,
+    ShapeOutline,
+    ShapeType,
+    validate_shape_size_range,
+)
 
 rgb_color_type = tuple[int, int, int]
 
@@ -150,6 +158,7 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                  transform: Optional[Callable[[Any], Any]] = None,
                  save_location: str = "shape_dataset",
                  seed: Optional[int] = None,):
+        validate_shape_size_range(image_size, shape_size_range)
         self.num_images = num_images
         self.image_size = image_size
         self.num_shapes_range = num_shapes_range

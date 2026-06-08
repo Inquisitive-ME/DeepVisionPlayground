@@ -94,6 +94,7 @@ class MultiHeatmapNet(nn.Module):
         out: HeatmapOutput,
         max_objects: int,
         nms_kernel: int = 3,
+        dedup_radius: float | None = None,
     ) -> MultiHeatmapDecode:
         """Top-K NMS decode of a heatmap.
 
@@ -106,6 +107,16 @@ class MultiHeatmapNet(nn.Module):
         nms_kernel is the size of the local-max kernel. 3 means a peak
         must be a strict local max in its 3x3 neighborhood. Keeping it
         small avoids suppressing nearby distinct shapes.
+
+        The max-pool ``==`` test does NOT break ties on a flat plateau
+        (several adjacent cells with exactly equal scores), so a single
+        object can decode to multiple near-identical peaks. ``dedup_radius``
+        applies a greedy center-distance suppression after decode — a peak
+        within ``dedup_radius`` px of an already-kept higher-scoring peak has
+        its score zeroed (so the downstream confidence threshold drops it).
+        Defaults to two output cells (``2 * stride`` px), enough to collapse a
+        small plateau into one detection while staying well below the spacing of
+        genuinely distinct shapes; set 0 to disable.
         """
         B, _, H, W = out.heatmap.shape
         device = out.heatmap.device
@@ -128,6 +139,24 @@ class MultiHeatmapNet(nn.Module):
         cx_px = (px.float() + peak_offset[..., 0] - 0.5) * out.stride
         cy_px = (py.float() + peak_offset[..., 1] - 0.5) * out.stride
         centers_px = torch.stack([cx_px, cy_px], dim=-1)           # (B, K, 2)
+
+        radius = (2.0 * out.stride) if dedup_radius is None else dedup_radius
+        if radius > 0 and max_objects > 1:
+            # top_scores is already sorted descending per image, so iterating
+            # k in order is highest-score-first — standard greedy NMS.
+            for b in range(B):
+                kept: list[int] = []
+                for k in range(max_objects):
+                    if top_scores[b, k] <= 0:
+                        continue
+                    c = centers_px[b, k]
+                    if any(
+                        torch.linalg.norm(c - centers_px[b, j]) <= radius for j in kept
+                    ):
+                        top_scores[b, k] = 0.0  # duplicate -> filtered downstream
+                    else:
+                        kept.append(k)
+
         return MultiHeatmapDecode(
             centers_px=centers_px,
             scores=top_scores,

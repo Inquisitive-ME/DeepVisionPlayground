@@ -137,7 +137,11 @@ visible at a glance. Mental model for what each one tells you:
   gets 0; a perfect predictor gets 1. Lights up when localization
   works qualitatively even before pixel error is good.
 - **accuracy** (single) / **matched_class_accuracy** (multi) — class
-  correctness; multi is restricted to Hungarian-matched pairs.
+  correctness; multi is restricted to Hungarian-matched pairs. NOTE: all
+  `matched_*` multi metrics (matched center px, matched class accuracy) are
+  computed only over matched prediction/GT pairs — they ignore false positives
+  and missed objects, so judge detection quality by `map_center` +
+  `cardinality_error`, not the matched numbers alone.
 - **recall@T px** — fraction of GTs whose nearest prediction is within
   T pixels. Different thresholds reveal different failure modes:
   recall@2 is "are the centers exact?"; recall@16 is "did we find

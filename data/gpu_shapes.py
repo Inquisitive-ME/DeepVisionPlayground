@@ -23,9 +23,22 @@ Scope (intentional, kept tight to start):
 - Ellipses are axis-aligned even when ``rotate_shapes`` is True (matches the
   CPU dataset).
 - Rectangles and triangles can be rotated; rotation is computed on the CPU
-  before rendering so the GPU kernel doesn't need to know.
+  before rendering so the GPU kernel doesn't need to know. Like the CPU
+  dataset, rotations are retried to stay in-bounds and ``max_overlap`` is
+  enforced, so the two paths produce comparable distributions.
 
 Anything outside that scope, fall back to the CPU dataset for now.
+
+Known CPU/GPU rendering differences (small, but present — keep them in mind
+when comparing ``--gpu-data`` runs against CPU runs):
+
+- Circles: this renderer fills the exact analytic disc, which is a few percent
+  SMALLER than PIL's inclusive-bbox ``draw.ellipse`` (largest at small sizes,
+  ~10% area at the 20-px floor, <3% by 90 px). Rectangles/triangles match PIL.
+- Batch count: ``len(loader) == ceil(num_images / batch_size)`` and every batch
+  is full, so an epoch emits up to ``batch_size - 1`` more images than
+  ``num_images`` (the CPU DataLoader instead emits exactly ``num_images`` with a
+  smaller final batch). Throughput is reported off the actual emitted count.
 """
 from __future__ import annotations
 
@@ -37,7 +50,7 @@ from typing import Iterable
 import numpy as np
 import torch
 
-from data.annotations import BoundingBox, ShapeType
+from data.annotations import BoundingBox, ShapeType, validate_shape_size_range
 
 
 @dataclass
@@ -360,7 +373,7 @@ class GpuShapeLoader(Iterable):
         batch_size: int,
         num_images: int,
         image_size: tuple[int, int] = (256, 256),
-        num_shapes_range: tuple[int, int] = (1, 1),
+        num_shapes_range: tuple[int, int] = (0, 3),  # matches ShapeDataset's default
         shape_size_range: tuple[int, int] = (20, 90),
         shape_types: tuple[ShapeType, ...] = tuple(ShapeType),
         rotate_shapes: bool = False,
@@ -375,6 +388,7 @@ class GpuShapeLoader(Iterable):
             # A fixed val set needs a fixed seed; without one the reseed would
             # silently degrade to a different val set every epoch.
             raise ValueError("reseed_each_epoch=True requires a seed")
+        validate_shape_size_range(image_size, shape_size_range)
         self.batch_size = batch_size
         self.num_images = num_images
         self.image_size = image_size

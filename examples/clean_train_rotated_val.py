@@ -30,7 +30,7 @@ def make_loader(*, rotate: bool, num_images: int, seed: int, image_size, batch_s
     fixed so the train/val difference is rotation and nothing else."""
     ds = ShapeDataset(
         num_images=num_images, seed=seed, image_size=image_size,
-        num_shapes_range=(1, 1), shape_size_range=(20, 128),
+        num_shapes_range=(1, 1), shape_size_range=(15, 40),
         rotate_shapes=rotate, background=BackgroundType.SOLID,
         transform=transforms.ToTensor(),
     )

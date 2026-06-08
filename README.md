@@ -32,9 +32,14 @@ The single-object task is **fully solved**: ~400 K-param CenterNet-style
 heatmap model hits **median 1.8 px localization error** and **99.7%
 classification accuracy** in 5 minutes of training on a 3090.
 
-The multi-object task converges to **median 1.55 px** and **97.5% matched
-class accuracy** at 0–3 shapes per image; sweeps to higher counts are an
-ongoing experiment (results in `claude_project_notes/`).
+The multi-object task localizes **matched** objects to **median ~1.5 px** with
+**~97% matched-class accuracy** at 0–3 shapes per image. Read those as what they
+are: *matched-subset* metrics that, by construction, ignore false positives and
+missed objects. The honest "is it actually solved" number is **`map_center`** —
+a confidence-integrated average precision over pixel thresholds — together with
+`cardinality_error`; both are markedly less flattering than the matched numbers,
+and closing that gap (and sweeping to higher counts) is an ongoing experiment
+(results in `claude_project_notes/`).
 
 The most recent learning is documented in
 `claude_project_notes/2026-05-01_final_status.md`.

@@ -3,8 +3,26 @@ from __future__ import annotations
 
 import pytest
 
-from data.annotations import ShapeType
+from data.annotations import ShapeType, validate_shape_size_range
 from data.dataset_config import DatasetConfig, build_cpu_dataset
+
+
+class TestSizeValidation:
+    def test_min_above_half_image_raises(self):
+        # cap = 64//2 = 32; min 40 can't fit -> clear error, not a randrange crash.
+        with pytest.raises(ValueError):
+            validate_shape_size_range((64, 64), (40, 60))
+
+    def test_max_above_half_image_warns(self):
+        # cap = 256//2 = 128; max 200 is silently capped -> warn instead.
+        with pytest.warns(UserWarning):
+            validate_shape_size_range((256, 256), (20, 200))
+
+    def test_in_range_is_silent(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            validate_shape_size_range((256, 256), (20, 128))  # 128 == cap, fine
 
 
 class TestDatasetConfig:
