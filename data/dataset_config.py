@@ -113,6 +113,7 @@ def build_cpu_dataset(
     image_size: tuple[int, int],
     seed: int | None,
     transform: Any,
+    with_masks: bool = False,
 ) -> Any:
     """Build a CPU ``ShapeDataset`` from a DatasetConfig."""
     from data.synthetic_shapes_dataset import ShapeDataset
@@ -130,6 +131,7 @@ def build_cpu_dataset(
         max_overlap=cfg.max_overlap,
         add_noise=cfg.add_noise,
         transform=transform,
+        with_masks=with_masks,
     )
 
 
@@ -142,6 +144,7 @@ def build_gpu_loader(
     seed: int | None,
     device: Any,
     reseed_each_epoch: bool = False,
+    with_masks: bool = False,
 ) -> Any:
     """Build a GPU ``GpuShapeLoader`` from a DatasetConfig.
 
@@ -176,4 +179,5 @@ def build_gpu_loader(
         max_overlap=cfg.max_overlap,
         device=device,
         reseed_each_epoch=reseed_each_epoch,
+        with_masks=with_masks,
     )
