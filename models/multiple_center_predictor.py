@@ -5,6 +5,20 @@ from models.encoders import EncodeType, encoder
 from models.types import ModelType
 
 
+def _group_norm_1d(dim: int) -> nn.GroupNorm:
+    """Per-sample GroupNorm for an FC feature vector.
+
+    GroupNorm (unlike BatchNorm1d) has no running statistics, so train and
+    eval behave identically — required for honest distribution-shift eval,
+    where BatchNorm would normalize shifted val inputs with frozen clean-train
+    stats. Use up to 8 groups, falling back to a divisor of ``dim``.
+    """
+    groups = 8
+    while dim % groups != 0:
+        groups //= 2
+    return nn.GroupNorm(groups, dim)
+
+
 class CenterPredictor(nn.Module):
     def __init__(self,
                  num_classes: int,
@@ -29,7 +43,7 @@ class CenterPredictor(nn.Module):
             for dim in hidden_dims:
                 layers.extend([
                     nn.Linear(current_size, dim),
-                    nn.BatchNorm1d(dim),
+                    _group_norm_1d(dim),
                     nn.ReLU(),
                     nn.Dropout(0.1)
                 ])

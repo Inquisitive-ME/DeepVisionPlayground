@@ -54,15 +54,24 @@ pretty-prints the bucket sweeps as a Markdown table.
 ## The CLI flags worth knowing
 
 ```
+--config path/to/study.yaml
+    A self-contained study: run/model scalars plus train: / val: data
+    distributions (see configs/). When given it is authoritative — the other
+    flags are ignored. This is how you set up a distribution-shift study
+    (train on one distribution, validate on another); val inherits train and
+    overrides only what shifts, so there are no per-augmentation flags.
+
 --task {single, multi, heatmap, multi_heatmap}
     single         FC regression on one shape
     multi          FC + slot-based detection on N shapes (Hungarian-matched)
     heatmap        CenterNet heatmap on one shape (sub-pixel)
     multi_heatmap  CenterNet heatmap with NMS for N shapes (sub-pixel + multi)
 
---encoder {simple, simple_bn, simple_gap, simple_bn_gap,
-           resnet18, resnet18_spatial, resnet34, resnet34_spatial}
+--encoder {simple, simple_bn, simple_gn, simple_gap, simple_bn_gap,
+           simple_gn_gap, resnet18, resnet18_spatial, resnet34, resnet34_spatial}
     Affects: single, multi (heatmap variants use a built-in encoder).
+    Default simple_gn (GroupNorm) behaves the same in train/eval; simple_bn
+    and resnet* carry BatchNorm and bias distribution-shift measurements.
     *_gap variants are for classification — they have NO position info.
     *_spatial variants strip the AvgPool from torchvision ResNet.
 
@@ -93,13 +102,24 @@ pretty-prints the bucket sweeps as a Markdown table.
 --lambda-class / --lambda-conf
     Loss weights for the multi_loss. Default 1.0 each. Bumping
     lambda_class to 3.0 unblocks classification on the FC multi path.
+
+--class-match-weight
+    Weight of the class term inside the multi-object Hungarian matching cost
+    (default 0.1, separate from --lambda-class). Kept small so class only
+    breaks ties between near-coincident objects; a larger value lets class
+    override spatially-correct assignments (centers are normalized to [0,1]).
 ```
+
+Augmentations (rotation, noise, texture/outline, sizes, counts, shape types)
+are NOT CLI flags — they're per-distribution knobs in a `--config` study file,
+set independently for `train:` and `val:`. See `configs/README.md`.
 
 ## Useful scripts
 
 | Script | What it does |
 |---|---|
 | `python -m scripts.run_training ...` | Main training entry point |
+| `python -m scripts.eval_sweep --run-dir runs/<dir> ...` | Load a trained model and sweep a val-time perturbation (`--rotate`, `--noise`, `--backgrounds`, `--outlines`, `--counts`, `--sizes`, `--overlaps`) against its training distribution |
 | `python -m scripts.benchmark_models` | Runs the 5 reference configs and prints a comparison table |
 | `python -m scripts.sweep_buckets runs/<dir>` | Reads a results.json and pretty-prints the bucket metrics |
 | `python -m scripts.gpu_monitor` | Polls nvidia-smi and writes a CSV; run alongside training |
@@ -122,8 +142,10 @@ visible at a glance. Mental model for what each one tells you:
   T pixels. Different thresholds reveal different failure modes:
   recall@2 is "are the centers exact?"; recall@16 is "did we find
   every object roughly?".
-- **map_center** — mean of `precision*recall` across pixel thresholds.
-  Single number for ranking runs.
+- **map_center** — confidence-integrated average precision (area under the
+  PR curve, averaged over pixel thresholds). Single number for ranking runs;
+  independent of the confidence threshold, so FC-multi and heatmap models are
+  comparable on it.
 - **by_size/{xs,sm,md,lg}/...** — same metrics restricted to GT shapes
   in each size bucket. Tells you whether the model is failing on
   small shapes specifically.

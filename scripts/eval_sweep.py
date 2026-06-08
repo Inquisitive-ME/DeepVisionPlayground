@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from data.annotations import BackgroundType, ShapeOutline, ShapeType
+from data.dataset_config import DatasetConfig, build_cpu_dataset
 from data.synthetic_shapes_dataset import ShapeDataset
 from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
@@ -47,24 +48,42 @@ from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
 
 
-# Per-dimension defaults so a sweep that doesn't specify the field uses
-# the training value. We read these from the saved config when possible.
+# The model's evaluation baseline: the data distribution it was trained on
+# (so non-swept dimensions are held at the training value), plus the run-level
+# fields needed to build a loader. A sweep overrides one field of `dataset`.
 @dataclass
 class _ValDefaults:
+    dataset: DatasetConfig
     image_size: tuple[int, int]
-    num_shapes_range: tuple[int, int]
-    shape_size_range: tuple[int, int]
-    rotate_shapes: bool
-    background: BackgroundType
-    add_noise: bool
-    shape_outline: ShapeOutline
-    max_overlap: float
-    color_threshold: float
     num_val_images: int
     val_seed: int
     batch_size: int
     max_objects: int
     task: str
+
+
+def _legacy_dataset_config(cfg: dict[str, Any]) -> DatasetConfig:
+    """Reconstruct a DatasetConfig from an OLD flat config.json (pre-config-
+    refactor runs that stored train_background/train_rotate/... at top level)."""
+    is_single = cfg["task"] in ("single", "heatmap")
+    tss = cfg.get("train_shape_size", "")
+    if tss:
+        lo_str, hi_str = tss.split(":")
+        shape_size_range = (int(lo_str), int(hi_str))
+    else:
+        shape_size_range = (20, 128) if is_single else (20, 90)
+    tr = cfg.get("train_rotate", "default")
+    rotate = True if tr == "true" else False if tr == "false" else is_single
+    return DatasetConfig(
+        num_shapes_range=(1, 1) if is_single else (
+            int(cfg.get("num_shapes_min", 0)), int(cfg.get("num_shapes_max", 3)),
+        ),
+        shape_size_range=shape_size_range,
+        rotate_shapes=rotate,
+        background=cfg.get("train_background", "solid"),
+        shape_outline=cfg.get("train_outline", "fill"),
+        add_noise=bool(cfg.get("train_add_noise", False)),
+    )
 
 
 def _load_run(run_dir: Path) -> tuple[torch.nn.Module, dict[str, Any], _ValDefaults, torch.device]:
@@ -109,19 +128,18 @@ def _load_run(run_dir: Path) -> tuple[torch.nn.Module, dict[str, Any], _ValDefau
     model = model.to(device)
     model.eval()
 
-    is_single = cfg["task"] in ("single", "heatmap")
+    # The held-constant (non-swept) baseline is the model's ACTUAL training
+    # distribution, read from the saved config — so a sweep delta is the shift
+    # effect alone. New configs store it as a `train` DatasetConfig; older flat
+    # configs are reconstructed for backward compatibility.
+    train_cfg = cfg.get("train")
+    if isinstance(train_cfg, dict):
+        baseline = DatasetConfig.from_dict(train_cfg)
+    else:
+        baseline = _legacy_dataset_config(cfg)
     defaults = _ValDefaults(
+        dataset=baseline,
         image_size=img_size,
-        num_shapes_range=(1, 1) if is_single else (
-            int(cfg["num_shapes_min"]), int(cfg["num_shapes_max"]),
-        ),
-        shape_size_range=(20, 128) if is_single else (20, 90),
-        rotate_shapes=is_single,
-        background=BackgroundType.SOLID,
-        add_noise=False,
-        shape_outline=ShapeOutline.FILL,
-        max_overlap=0.6,
-        color_threshold=50.0,
         num_val_images=int(cfg["num_val_images"]),
         val_seed=int(cfg["val_seed"]),
         batch_size=int(cfg["batch_size"]),
@@ -132,26 +150,14 @@ def _load_run(run_dir: Path) -> tuple[torch.nn.Module, dict[str, Any], _ValDefau
 
 
 def _build_loader(d: _ValDefaults, device: torch.device) -> Any:
-    """Build a CPU val loader that respects every override.
+    """Build a CPU val loader for the (possibly perturbed) val distribution.
 
-    We always use the CPU dataset path for sweeps because the GPU loader
-    doesn't support backgrounds / noise / outlines / color thresholds /
-    overlap; the val pass is small and one-shot, so the speed difference
-    isn't material here.
+    Sweeps always use the CPU dataset path because the GPU loader doesn't
+    support backgrounds / noise / outlines; the val pass is small and one-shot.
     """
-    ds = ShapeDataset(
-        num_images=d.num_val_images,
-        seed=d.val_seed,
-        image_size=d.image_size,
-        num_shapes_range=d.num_shapes_range,
-        shape_size_range=d.shape_size_range,
-        shape_types=tuple(ShapeType),
-        background=d.background,
-        shape_outline=d.shape_outline,
-        rotate_shapes=d.rotate_shapes,
-        max_overlap=d.max_overlap,
-        add_noise=d.add_noise,
-        transform=transforms.ToTensor(),
+    ds = build_cpu_dataset(
+        d.dataset, num_images=d.num_val_images, image_size=d.image_size,
+        seed=d.val_seed, transform=transforms.ToTensor(),
     )
     return DataLoader(
         ds, batch_size=d.batch_size, shuffle=False,
@@ -188,9 +194,9 @@ def _sweep(model: torch.nn.Module, defaults: _ValDefaults, device: torch.device,
     results: dict[str, dict[str, float]] = {}
     print(f"\n=== sweep: {dim_name} ===")
     for label, overrides in perturbations:
-        # Build a per-perturbation defaults instance.
+        # Override just the swept field(s) of the baseline distribution.
         from dataclasses import replace
-        d = replace(defaults, **overrides)
+        d = replace(defaults, dataset=defaults.dataset.merged(overrides))
         loader = _build_loader(d, device)
         vm = _evaluate(model, loader, d, device)
         # Pick the right metric subset for the task.
@@ -264,11 +270,9 @@ def main() -> int:
         bg_perts: list[Pert] = []
         for v in args.backgrounds.split(","):
             v = v.strip().lower()
-            try:
-                bg = BackgroundType[v.upper()]
-            except KeyError:
-                raise SystemExit(f"unknown background {v!r}") from None
-            bg_perts.append((v, {"background": bg}))
+            if v.upper() not in BackgroundType.__members__:
+                raise SystemExit(f"unknown background {v!r}")
+            bg_perts.append((v, {"background": v}))
         sweeps["backgrounds"] = _sweep(model, defaults, device, "background", bg_perts)
 
     if args.noise:
@@ -285,11 +289,9 @@ def main() -> int:
         outline_perts: list[Pert] = []
         for v in args.outlines.split(","):
             v = v.strip().lower()
-            try:
-                ol = ShapeOutline[v.upper()]
-            except KeyError:
-                raise SystemExit(f"unknown outline {v!r}") from None
-            outline_perts.append((v, {"shape_outline": ol}))
+            if v.upper() not in ShapeOutline.__members__:
+                raise SystemExit(f"unknown outline {v!r}")
+            outline_perts.append((v, {"shape_outline": v}))
         sweeps["outlines"] = _sweep(model, defaults, device, "shape_outline", outline_perts)
 
     if args.color_thresholds:

@@ -57,6 +57,34 @@ class TestLossGradients:
         # produce a >50 loss; the buggy version did.
         assert float(loss) < 10.0
 
+    def test_class_does_not_override_geometric_match(self):
+        """Two GTs ~38 px apart; each prediction sits exactly on its matching
+        GT but its class logits point at the OTHER GT's class. With the small
+        default class_match_weight, matching must follow geometry, so the
+        coordinate loss (isolated via lambda_class=lambda_conf=0) is ~0. A large
+        weight lets class flip the assignment and the coordinate loss rises."""
+        # pred0 @ (0.40, 0.40) favors class 1; pred1 @ (0.55, 0.40) favors class 0.
+        pred = torch.tensor([[
+            [0.40, 0.40, 0.9, -2.0, 2.0, -2.0],
+            [0.55, 0.40, 0.9, 2.0, -2.0, -2.0],
+        ]])
+        gt_centers = [torch.tensor([[0.40, 0.40], [0.55, 0.40]])]
+        gt_classes = [torch.tensor([0, 1])]  # GT0=class0, GT1=class1
+
+        coord_only = dict(lambda_class=0.0, lambda_conf=0.0)
+        loss_default = CenterPredictionLoss(
+            model_type=ModelType.center_localization_and_class_id, **coord_only,
+        )(pred, gt_centers, gt_classes)
+        loss_class_dominated = CenterPredictionLoss(
+            model_type=ModelType.center_localization_and_class_id,
+            class_match_weight=1.0, **coord_only,
+        )(pred, gt_centers, gt_classes)
+
+        # Geometry-respecting match -> predictions coincide with GT -> ~0 coord.
+        assert float(loss_default) < 1e-4
+        # Class-dominated match flips the pairing -> nonzero coordinate loss.
+        assert float(loss_class_dominated) > float(loss_default)
+
     def test_lambda_class_weights_class_term(self):
         raw, pred = _make_pred()
         gt_centers = [torch.tensor([[0.5, 0.5]])] * 2

@@ -7,30 +7,38 @@ import torchvision.models as models
 class EncodeType(Enum):
     simple = auto()
     simple_bn = auto()
+    simple_gn = auto()
     simple_gap = auto()
     simple_bn_gap = auto()
+    simple_gn_gap = auto()
     resnet18 = auto()
     resnet18_spatial = auto()
     resnet34 = auto()
     resnet34_spatial = auto()
 
 
-def _simple_block(in_ch: int, out_ch: int, with_bn: bool) -> list[nn.Module]:
+def _simple_block(in_ch: int, out_ch: int, norm: str) -> list[nn.Module]:
     layers: list[nn.Module] = [
         nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
     ]
-    if with_bn:
+    if norm == "batch":
         layers.append(nn.BatchNorm2d(out_ch))
+    elif norm == "group":
+        # 8-group GroupNorm: per-sample, so train and eval behave identically
+        # (no running-stats drift). All channel counts here are multiples of 8.
+        layers.append(nn.GroupNorm(8, out_ch))
+    elif norm != "none":
+        raise ValueError(f"unknown norm: {norm}")
     layers.append(nn.ReLU(inplace=True))
     return layers
 
 
-def _simple_stack(with_bn: bool) -> nn.Sequential:
+def _simple_stack(norm: str) -> nn.Sequential:
     layers: list[nn.Module] = []
-    layers.extend(_simple_block(3, 16, with_bn))      # 256 -> 128
-    layers.extend(_simple_block(16, 32, with_bn))     # 128 -> 64
-    layers.extend(_simple_block(32, 64, with_bn))     # 64 -> 32
-    layers.extend(_simple_block(64, 128, with_bn))    # 32 -> 16
+    layers.extend(_simple_block(3, 16, norm))      # 256 -> 128
+    layers.extend(_simple_block(16, 32, norm))     # 128 -> 64
+    layers.extend(_simple_block(32, 64, norm))     # 64 -> 32
+    layers.extend(_simple_block(64, 128, norm))    # 32 -> 16
     return nn.Sequential(*layers)
 
 
@@ -39,12 +47,20 @@ def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
         # Original 4-conv stack. Keeps spatial 16x16x128 features so a FC
         # head can localize. Flatten included so the encoder always emits
         # a 2-D tensor; SimpleCenterNet's own Flatten then becomes a no-op.
-        model: nn.Module = nn.Sequential(_simple_stack(with_bn=False), nn.Flatten())
+        model: nn.Module = nn.Sequential(_simple_stack(norm="none"), nn.Flatten())
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_bn:
-        # Same stack with BatchNorm after every conv. Typically converges
-        # quicker than the no-BN variant on these synthetic tasks.
-        model = nn.Sequential(_simple_stack(with_bn=True), nn.Flatten())
+        # Same stack with BatchNorm after every conv. Converges quickly but
+        # uses running stats that drift on fresh-data-per-epoch training, so
+        # eval predictions diverge from train — NOT suitable for distribution-
+        # shift studies. Prefer simple_gn for those.
+        model = nn.Sequential(_simple_stack(norm="batch"), nn.Flatten())
+        features_out_size = 128 * 16 * 16
+    elif encoder_type is EncodeType.simple_gn:
+        # Same stack with GroupNorm. Per-sample normalization, so train and
+        # eval behave identically — the right default for the localization
+        # tasks and for honest distribution-shift measurement.
+        model = nn.Sequential(_simple_stack(norm="group"), nn.Flatten())
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_gap:
         # GAP'd to 128 features. Removes the 8M-parameter FC head you'd
@@ -52,14 +68,21 @@ def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
         # spatial information a localizer needs. Only appropriate for
         # tasks where position doesn't matter (e.g. pure classification).
         model = nn.Sequential(
-            _simple_stack(with_bn=False),
+            _simple_stack(norm="none"),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
         )
         features_out_size = 128
     elif encoder_type is EncodeType.simple_bn_gap:
         model = nn.Sequential(
-            _simple_stack(with_bn=True),
+            _simple_stack(norm="batch"),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+        features_out_size = 128
+    elif encoder_type is EncodeType.simple_gn_gap:
+        model = nn.Sequential(
+            _simple_stack(norm="group"),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
         )

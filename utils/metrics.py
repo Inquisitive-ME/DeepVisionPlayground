@@ -82,7 +82,8 @@ class MultiObjectMetrics:
     mean_conf_unmatched: float = 0.0
     precision_at: dict[int, float] = field(default_factory=dict)
     recall_at: dict[int, float] = field(default_factory=dict)
-    map_center: float = 0.0  # average over thresholds of (P*R) ... see below
+    map_center: float = 0.0  # confidence-integrated center-AP ... see below
+    confidence_threshold: float = 0.5  # cutoff used for the at-threshold P/R
     pearson_cx: float = 0.0  # over class-agnostic Hungarian matched pairs
     pearson_cy: float = 0.0
     # Per-class breakdowns. Keys are class indices (0..num_classes-1); the
@@ -121,6 +122,7 @@ class MultiObjectMetrics:
             "multi/mean_conf_matched": self.mean_conf_matched,
             "multi/mean_conf_unmatched": self.mean_conf_unmatched,
             "multi/map_center": self.map_center,
+            "multi/confidence_threshold": self.confidence_threshold,
             "multi/pearson_cx": self.pearson_cx,
             "multi/pearson_cy": self.pearson_cy,
         }
@@ -236,6 +238,87 @@ def _hungarian_match_pixels(
     return pred_idx, gt_idx
 
 
+def _voc_ap(recalls: np.ndarray, precisions: np.ndarray) -> float:
+    """All-points (VOC2010+) average precision under a precision-recall curve.
+
+    Recall is extended to 1.0 with precision 0, so undetected GT (recall that
+    never reaches 1) is correctly penalized. Precision is made monotonically
+    non-increasing before integrating over the recall steps.
+    """
+    mrec = np.concatenate(([0.0], recalls, [1.0]))
+    mpre = np.concatenate(([0.0], precisions, [0.0]))
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = max(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
+
+
+def _center_average_precision(
+    ap_images: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    total_gt: int,
+    pixel_thresholds: tuple[int, ...],
+) -> float:
+    """Confidence-integrated center-AP, averaged over pixel thresholds.
+
+    For each pixel threshold, every prediction (across all images, at ALL
+    confidences) is ranked by confidence and greedily matched to the nearest
+    unmatched GT within the threshold; the resulting TP/FP sequence gives a
+    PR curve whose area is the AP. Averaging the per-image-independent ranking
+    over the whole val set and integrating over confidence makes the score
+    independent of any single confidence cutoff — so models whose confidences
+    live on different scales (e.g. focal heatmap peaks ~0.3 vs BCE slots ~1.0)
+    are directly comparable.
+
+    Each ``ap_images`` entry is ``(confidences, pred_centers_px, gt_centers_px)``
+    for one image, using ALL predicted slots (not just thresholded ones).
+    """
+    if total_gt == 0:
+        return 0.0
+    aps: list[float] = []
+    for t in pixel_thresholds:
+        scored: list[tuple[float, int]] = []  # (confidence, is_tp)
+        for confs, pred_px, gt_px in ap_images:
+            n_pred = confs.shape[0]
+            if n_pred == 0:
+                continue
+            n_gt = gt_px.shape[0] if gt_px.ndim == 2 else 0
+            matched = np.zeros(n_gt, dtype=bool)
+            # Stable sort so equal-confidence predictions are processed in a
+            # deterministic order (e.g. the zero-confidence padding slots the
+            # heatmap top-K decode emits, which would otherwise make the AP
+            # depend on an arbitrary spatial tie-break).
+            for i in np.argsort(-confs, kind="stable"):
+                if n_gt == 0:
+                    scored.append((float(confs[i]), 0))
+                    continue
+                dist = np.linalg.norm(pred_px[i] - gt_px, axis=-1)
+                dist_avail = np.where(matched, np.inf, dist)
+                j = int(np.argmin(dist_avail))
+                if dist_avail[j] <= t:
+                    matched[j] = True
+                    scored.append((float(confs[i]), 1))
+                else:
+                    scored.append((float(confs[i]), 0))
+        if not scored:
+            aps.append(0.0)
+            continue
+        # Rank by confidence desc; within a confidence tie put false positives
+        # before true positives (is_tp ascending) — the standard pessimistic
+        # convention, so ties never optimistically inflate precision and the
+        # AP is order-independent.
+        scored.sort(key=lambda e: (-e[0], e[1]))
+        tp = fp = 0
+        recalls: list[float] = []
+        precisions: list[float] = []
+        for _conf, is_tp in scored:
+            tp += is_tp
+            fp += 1 - is_tp
+            recalls.append(tp / total_gt)
+            precisions.append(tp / (tp + fp))
+        aps.append(_voc_ap(np.asarray(recalls), np.asarray(precisions)))
+    return float(np.mean(aps)) if aps else 0.0
+
+
 def evaluate_multi_object(
     preds: torch.Tensor,
     gt_centers_list: list[torch.Tensor],
@@ -290,6 +373,9 @@ def evaluate_multi_object(
     pearson_pairs_y: list[tuple[float, float]] = []
     n_gt_total = 0
     n_pred_total = 0
+    # Per-image (confidences, pred_centers_px, gt_centers_px) over ALL slots,
+    # used to compute the confidence-integrated AP (map_center) after the loop.
+    ap_images: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     # Global per-threshold counters.
     tp_at = {t: 0 for t in pixel_thresholds}
     fp_at = {t: 0 for t in pixel_thresholds}
@@ -329,6 +415,8 @@ def evaluate_multi_object(
         gt_centers_px = _normalized_centers_to_pixels(gt_centers, image_size)
         n_gt = gt_centers_px.shape[0] if gt_centers_px.ndim == 2 else 0
         n_pred = int(keep.sum())
+        # Stash ALL slots (unfiltered by confidence) for the AP computation.
+        ap_images.append((confs, pred_centers_px, gt_centers_px))
         n_gt_total += n_gt
         n_pred_total += n_pred
         cardinality_err.append(abs(n_pred - n_gt))
@@ -477,14 +565,14 @@ def evaluate_multi_object(
         t: (tp_at[t] / (tp_at[t] + fn_at[t])) if (tp_at[t] + fn_at[t]) > 0 else 0.0
         for t in pixel_thresholds
     }
-    # "Center mAP" here is the average of P*R across thresholds — a single
-    # scalar that goes up only when both precision and recall improve. (This
-    # is not COCO mAP; we don't have IoUs without bboxes. Rename if/when we
-    # add bbox heads.)
-    map_center = (
-        float(np.mean([precision_at[t] * recall_at[t] for t in pixel_thresholds]))
-        if pixel_thresholds else 0.0
-    )
+    # "Center mAP" here is a confidence-integrated average precision: for each
+    # pixel threshold we rank every prediction by confidence, build a PR curve,
+    # take its area (AP), and average over thresholds. Because it integrates
+    # over the confidence axis, it does NOT depend on confidence_threshold, so
+    # models whose confidence scores live on different scales (focal heatmap
+    # peaks vs BCE slot confidences) are directly comparable. (Still center-
+    # distance based, not IoU — not COCO mAP.)
+    map_center = _center_average_precision(ap_images, n_gt_total, pixel_thresholds)
 
     per_class_precision_at: dict[int, dict[int, float]] = {}
     per_class_recall_at: dict[int, dict[int, float]] = {}
@@ -552,6 +640,7 @@ def evaluate_multi_object(
         precision_at=precision_at,
         recall_at=recall_at,
         map_center=map_center,
+        confidence_threshold=confidence_threshold,
         pearson_cx=pearson_cx,
         pearson_cy=pearson_cy,
         per_class_precision_at=per_class_precision_at,

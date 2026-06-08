@@ -16,18 +16,19 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+import yaml
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from data.annotations import BackgroundType, ShapeOutline, ShapeType
-from data.gpu_shapes import GpuShapeLoader
+from data.annotations import ShapeType
+from data.dataset_config import DatasetConfig, build_cpu_dataset, build_gpu_loader
 from data.synthetic_shapes_dataset import ShapeDataset, seed_worker
 from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
@@ -44,36 +45,56 @@ from utils.training_logger import TrainingLogger
 
 @dataclass
 class RunConfig:
-    task: str  # "single" or "multi"
-    encoder: str
-    epochs: int
-    batch_size: int
-    image_size: int
-    lr: float
-    num_train_images: int
-    num_val_images: int
-    max_objects: int
-    hidden_dims: tuple[int, ...]
-    num_shapes_min: int
-    num_shapes_max: int
-    seed: int
-    val_seed: int
-    num_workers: int
-    gpu_data: bool
-    lambda_class: float
-    lambda_conf: float
-    heatmap_stride: int
-    val_shape_counts: tuple[int, ...]
-    val_shape_sizes: tuple[tuple[int, int], ...]
-    val_overlaps: tuple[float, ...]
-    train_background: str
-    train_outline: str
-    train_add_noise: bool
-    train_shape_size: str
+    """A full, self-contained run/study spec.
+
+    The data distributions are first-class: ``train`` and ``val`` are each a
+    ``DatasetConfig``, so "train on one distribution, evaluate on another"
+    (e.g. train without rotation, validate with it) is expressed by giving
+    ``val`` different knobs — no per-augmentation CLI flag needed. Defaults
+    match the historical CLI behavior, so a config file can omit anything it
+    doesn't change.
+    """
+    task: str = "single"
+    encoder: str = "simple_gn"
+    epochs: int = 30
+    batch_size: int = 100
+    image_size: int = 256
+    lr: float = 1e-4
+    num_train_images: int = 1000
+    num_val_images: int = 200
+    max_objects: int = 5
+    hidden_dims: tuple[int, ...] = ()
+    seed: int = 0
+    val_seed: int = 1234
+    num_workers: int = 4
+    gpu_data: bool = False
+    lambda_class: float = 1.0
+    lambda_conf: float = 1.0
+    class_match_weight: float = 0.1
+    heatmap_stride: int = 4
+    val_shape_counts: tuple[int, ...] = ()
+    val_shape_sizes: tuple[tuple[int, int], ...] = ()
+    val_overlaps: tuple[float, ...] = ()
+    # The train and val data distributions. Both default to an independent
+    # default DatasetConfig here; parse_args() and load_run_config() always set
+    # them explicitly (val inherits train), so val mirrors train unless a study
+    # config overrides it. (Construct RunConfig directly => set val yourself.)
+    train: DatasetConfig = field(default_factory=DatasetConfig)
+    val: DatasetConfig = field(default_factory=DatasetConfig)
 
 
 def parse_args() -> RunConfig:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--config", type=str, default="",
+        help=(
+            "Path to a YAML study config (see configs/). When given it is the "
+            "authoritative, self-contained run spec — including the train/val "
+            "data distributions — and the other CLI flags are ignored. This is "
+            "how you run a distribution-shift study (e.g. train without rotation, "
+            "validate with it) without per-augmentation flags."
+        ),
+    )
     p.add_argument(
         "--task",
         choices=("single", "multi", "heatmap", "multi_heatmap"),
@@ -82,11 +103,17 @@ def parse_args() -> RunConfig:
     p.add_argument(
         "--encoder",
         choices=(
-            "simple", "simple_bn", "simple_gap", "simple_bn_gap",
+            "simple", "simple_bn", "simple_gn",
+            "simple_gap", "simple_bn_gap", "simple_gn_gap",
             "resnet18", "resnet18_spatial",
             "resnet34", "resnet34_spatial",
         ),
-        default="simple_bn",
+        default="simple_gn",
+        help=(
+            "GroupNorm (simple_gn) is the default: per-sample norm behaves "
+            "identically in train/eval. simple_bn and the resnet* encoders use "
+            "BatchNorm, whose frozen eval stats bias distribution-shift studies."
+        ),
     )
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=100)
@@ -120,27 +147,20 @@ def parse_args() -> RunConfig:
         help="Multi-object loss weight on the confidence BCE.",
     )
     p.add_argument(
+        "--class-match-weight", type=float, default=0.1,
+        help=(
+            "Weight of the class term inside the multi-object Hungarian "
+            "matching cost. Kept small (default 0.1) so class only breaks "
+            "geometric ties; centers are normalized to [0, 1], so a larger "
+            "weight would let class override spatially-correct assignments."
+        ),
+    )
+    p.add_argument(
         "--heatmap-stride", type=int, default=4,
         help=(
             "Output stride for heatmap models. 4 = 64x64 heatmap on 256-px input, "
             "fast and ~2-3 px median error. 2 = 128x128, sub-pixel error. 1 = 256x256."
         ),
-    )
-    p.add_argument(
-        "--train-background", choices=("solid", "texture", "random"), default="solid",
-        help="Training-time background type. RANDOM mixes solid and texture.",
-    )
-    p.add_argument(
-        "--train-outline", choices=("fill", "thin", "thick", "random"), default="fill",
-        help="Training-time shape outline. RANDOM mixes fill and outline thickness.",
-    )
-    p.add_argument(
-        "--train-add-noise", action="store_true",
-        help="Add Gaussian noise (sigma=10) to training images.",
-    )
-    p.add_argument(
-        "--train-shape-size", type=str, default="",
-        help="Override training shape_size_range as 'min:max' (e.g. '10:200').",
     )
     p.add_argument(
         "--val-shape-counts", type=str, default="",
@@ -172,6 +192,9 @@ def parse_args() -> RunConfig:
     )
     args = p.parse_args()
 
+    if args.config:
+        return load_run_config(args.config)
+
     hd = tuple(int(x) for x in args.hidden_dims.split(",") if x) if args.hidden_dims else ()
     val_shape_counts = tuple(int(x) for x in args.val_shape_counts.split(",") if x) if args.val_shape_counts else ()
     val_shape_sizes_raw = [s for s in args.val_shape_sizes.split(",") if s] if args.val_shape_sizes else []
@@ -180,6 +203,12 @@ def parse_args() -> RunConfig:
         lo, hi = s.split(":")
         val_shape_sizes.append((int(lo), int(hi)))
     val_overlaps = tuple(float(x) for x in args.val_overlaps.split(",") if x) if args.val_overlaps else ()
+    # No config file: build the train distribution from the per-task default
+    # plus the surviving --num-shapes flags; val mirrors train (the historical
+    # behavior). Augmentation/rotation studies go through a --config file.
+    train_dc = DatasetConfig.default_for_task(
+        args.task, num_shapes_range=(args.num_shapes_min, args.num_shapes_max),
+    )
     return RunConfig(
         task=args.task,
         encoder=args.encoder,
@@ -191,23 +220,53 @@ def parse_args() -> RunConfig:
         num_val_images=args.num_val_images,
         max_objects=args.max_objects,
         hidden_dims=hd,
-        num_shapes_min=args.num_shapes_min,
-        num_shapes_max=args.num_shapes_max,
         seed=args.seed,
         val_seed=args.val_seed,
         num_workers=args.num_workers,
         gpu_data=args.gpu_data,
         lambda_class=args.lambda_class,
         lambda_conf=args.lambda_conf,
+        class_match_weight=args.class_match_weight,
         heatmap_stride=args.heatmap_stride,
         val_shape_counts=val_shape_counts,
         val_shape_sizes=tuple(val_shape_sizes),
         val_overlaps=val_overlaps,
-        train_background=args.train_background,
-        train_outline=args.train_outline,
-        train_add_noise=args.train_add_noise,
-        train_shape_size=args.train_shape_size,
+        train=train_dc,
+        val=train_dc.merged(None),
     )
+
+
+def load_run_config(path: str) -> RunConfig:
+    """Load a YAML study config into a RunConfig.
+
+    Top-level keys are run/model scalars (task, encoder, epochs, ...). The
+    ``train:`` and ``val:`` sub-maps are DatasetConfig knobs; ``val`` inherits
+    every field of ``train`` and overrides only what it lists, so a shift study
+    is just the one knob that differs.
+    """
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    train_section = raw.pop("train", None)
+    val_section = raw.pop("val", None)
+    # Seed from the per-task default so a config can omit task-specific knobs
+    # (e.g. a heatmap study inherits num_shapes_range=(1,1) without restating it).
+    base = DatasetConfig.default_for_task(raw.get("task", "single"))
+    train_dc = base.merged(train_section)
+    val_dc = train_dc.merged(val_section)  # val inherits train, overrides applied
+
+    known = {f.name for f in fields(RunConfig)} - {"train", "val"}
+    unknown = set(raw) - known
+    if unknown:
+        raise ValueError(f"unknown study-config keys: {sorted(unknown)} (valid: {sorted(known)})")
+    scalars: dict[str, Any] = dict(raw)
+    if "hidden_dims" in scalars and scalars["hidden_dims"] is not None:
+        scalars["hidden_dims"] = tuple(scalars["hidden_dims"])
+    for k in ("val_shape_counts", "val_overlaps"):
+        if scalars.get(k) is not None:
+            scalars[k] = tuple(scalars[k])
+    if scalars.get("val_shape_sizes") is not None:
+        scalars["val_shape_sizes"] = tuple(tuple(p) for p in scalars["val_shape_sizes"])
+    return RunConfig(train=train_dc, val=val_dc, **scalars)
 
 
 def _ann_size_px(o: Any) -> float:
@@ -228,42 +287,35 @@ def _build_sweep_loader(
     num_shapes_range: tuple[int, int],
     shape_size_range: tuple[int, int],
     label: str,
-    max_overlap: float = 0.6,
+    max_overlap: float | None = None,
 ) -> Any:
     """Build a one-off val loader at a different num_shapes / shape_size /
     max_overlap config.
 
-    The GPU loader doesn't currently support max_overlap (it doesn't know
-    about overlap suppression at all), so overlap sweeps automatically fall
-    back to the CPU dataset path even when --gpu-data is set. CPU is fine
-    here because the val pass is small and one-shot.
+    The sweep starts from the run's val distribution (``cfg.val``) and overrides
+    only the swept dimension, so everything else (rotation, background, outline,
+    noise) matches the model's evaluation distribution. With --gpu-data every
+    sweep point — including overlap — is built by the GPU loader, which now
+    enforces max_overlap, so all points come from ONE renderer and are
+    comparable; otherwise it uses the CPU dataset.
     """
     print(f"  building sweep loader for {label}")
-    use_cpu_for_overlap = max_overlap != 0.6
-    if cfg.gpu_data and not use_cpu_for_overlap:
-        return GpuShapeLoader(
-            batch_size=cfg.batch_size,
-            num_images=cfg.num_val_images,
-            seed=cfg.val_seed,
-            image_size=img_size,
-            num_shapes_range=num_shapes_range,
-            shape_size_range=shape_size_range,
-            shape_types=tuple(ShapeType),
-            rotate_shapes=False,
-            device=device,
+    overrides: dict[str, Any] = {
+        "num_shapes_range": num_shapes_range,
+        "shape_size_range": shape_size_range,
+    }
+    if max_overlap is not None:  # only the overlap sweep overrides this
+        overrides["max_overlap"] = max_overlap
+    sweep_dc = cfg.val.merged(overrides)
+    if cfg.gpu_data:
+        return build_gpu_loader(
+            sweep_dc, batch_size=cfg.batch_size, num_images=cfg.num_val_images,
+            image_size=img_size, seed=cfg.val_seed, device=device,
+            reseed_each_epoch=True,
         )
-    sweep_dataset = ShapeDataset(
-        num_images=cfg.num_val_images,
-        seed=cfg.val_seed,
-        image_size=img_size,
-        num_shapes_range=num_shapes_range,
-        shape_size_range=shape_size_range,
-        shape_types=tuple(ShapeType),
-        background=BackgroundType.SOLID,
-        shape_outline=ShapeOutline.FILL,
-        rotate_shapes=False,
-        max_overlap=max_overlap,
-        transform=transforms.ToTensor(),
+    sweep_dataset = build_cpu_dataset(
+        sweep_dc, num_images=cfg.num_val_images, image_size=img_size,
+        seed=cfg.val_seed, transform=transforms.ToTensor(),
     )
     return DataLoader(
         sweep_dataset, batch_size=cfg.batch_size, shuffle=False,
@@ -473,84 +525,40 @@ def main() -> None:
     model_type = ModelType.center_localization_and_class_id
     transform = transforms.ToTensor()
 
-    train_kwargs: dict[str, Any] = dict(
-        image_size=img_size,
-        shape_types=tuple(ShapeType),
-        shape_size_range=(20, 90),
-        background=BackgroundType.SOLID,
-        shape_outline=ShapeOutline.FILL,
-        add_noise=False,
-        rotate_shapes=False,
-        max_overlap=0.6,
-        transform=transform,
-    )
-
-    if cfg.task in ("single", "heatmap"):
-        train_kwargs["num_shapes_range"] = (1, 1)
-        train_kwargs["shape_size_range"] = (20, 128)
-        train_kwargs["rotate_shapes"] = True
-    else:
-        train_kwargs["num_shapes_range"] = (cfg.num_shapes_min, cfg.num_shapes_max)
-    if cfg.task == "multi_heatmap":
-        # Multi heatmap shares the multi data shape (variable shapes per image).
-        train_kwargs["rotate_shapes"] = False
-
-    # Apply training-time augmentation overrides.
-    if cfg.train_background != "solid":
-        train_kwargs["background"] = BackgroundType[cfg.train_background.upper()]
-    if cfg.train_outline != "fill":
-        train_kwargs["shape_outline"] = ShapeOutline[cfg.train_outline.upper()]
-    if cfg.train_add_noise:
-        train_kwargs["add_noise"] = True
-    if cfg.train_shape_size:
-        size_lo_str, size_hi_str = cfg.train_shape_size.split(":")
-        train_kwargs["shape_size_range"] = (int(size_lo_str), int(size_hi_str))
-
+    train_dc = cfg.train
+    val_dc = cfg.val
     train_seed = cfg.seed if cfg.seed != 0 else None
+    # The model always has one class slot per shape type; a config that
+    # generates only a subset still uses the full class space (so e.g.
+    # train-on-rect+circle / test-on-triangle keeps consistent indices).
+    num_classes = len(ShapeType)
+    class_names = tuple(s.name for s in ShapeType)
 
     if cfg.gpu_data:
         if device.type != "cuda":
-            raise RuntimeError("--gpu-data requires CUDA")
-        if train_kwargs["background"] is not BackgroundType.SOLID:
-            raise NotImplementedError(
-                "--gpu-data only supports SOLID backgrounds; remove --gpu-data "
-                "to use the CPU PIL path with backgrounds/outlines/noise."
-            )
-        if train_kwargs["shape_outline"] is not ShapeOutline.FILL:
-            raise NotImplementedError(
-                "--gpu-data only supports filled shapes. Drop --gpu-data for "
-                "outline experiments."
-            )
-        if train_kwargs.get("add_noise"):
-            raise NotImplementedError(
-                "--gpu-data does not support add_noise. Drop --gpu-data."
-            )
-        gpu_kwargs = dict(
-            image_size=img_size,
-            num_shapes_range=train_kwargs["num_shapes_range"],
-            shape_size_range=train_kwargs["shape_size_range"],
-            shape_types=train_kwargs["shape_types"],
-            rotate_shapes=train_kwargs["rotate_shapes"],
-            device=device,
+            raise RuntimeError("gpu_data requires CUDA")
+        train_loader: Any = build_gpu_loader(
+            train_dc, batch_size=cfg.batch_size, num_images=cfg.num_train_images,
+            image_size=img_size, seed=train_seed, device=device,
+            reseed_each_epoch=False,  # train draws fresh data every epoch
         )
-        train_loader: Any = GpuShapeLoader(
-            batch_size=cfg.batch_size,
-            num_images=cfg.num_train_images,
-            seed=train_seed,
-            **gpu_kwargs,
+        # Val must be a FIXED dataset across epochs (reseed_each_epoch=True), or
+        # the val metric is computed on different data every epoch.
+        val_loader: Any = build_gpu_loader(
+            val_dc, batch_size=cfg.batch_size, num_images=cfg.num_val_images,
+            image_size=img_size, seed=cfg.val_seed, device=device,
+            reseed_each_epoch=True,
         )
-        val_loader: Any = GpuShapeLoader(
-            batch_size=cfg.batch_size,
-            num_images=cfg.num_val_images,
-            seed=cfg.val_seed,
-            **gpu_kwargs,
-        )
-        num_classes = len(ShapeType)
-        class_names = tuple(s.name for s in ShapeType)
     else:
-        train_dataset = ShapeDataset(num_images=cfg.num_train_images, seed=train_seed, **train_kwargs)
-        val_dataset = ShapeDataset(num_images=cfg.num_val_images, seed=cfg.val_seed, **train_kwargs)
         pin_memory = device.type == "cuda"
+        train_dataset = build_cpu_dataset(
+            train_dc, num_images=cfg.num_train_images, image_size=img_size,
+            seed=train_seed, transform=transform,
+        )
+        val_dataset = build_cpu_dataset(
+            val_dc, num_images=cfg.num_val_images, image_size=img_size,
+            seed=cfg.val_seed, transform=transform,
+        )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.batch_size, shuffle=True,
             collate_fn=ShapeDataset.collate_function,
@@ -562,8 +570,6 @@ def main() -> None:
             collate_fn=ShapeDataset.collate_function,
             num_workers=0, pin_memory=pin_memory,
         )
-        num_classes = len(train_dataset.get_classes())
-        class_names = tuple(train_dataset.get_classes())
     if cfg.task == "single":
         model: torch.nn.Module = SimpleCenterNet(
             num_classes=num_classes,
@@ -590,6 +596,7 @@ def main() -> None:
         model_type=model_type,
         lambda_class=cfg.lambda_class,
         lambda_conf=cfg.lambda_conf,
+        class_match_weight=cfg.class_match_weight,
     )
     heatmap_loss_fn = HeatmapLoss(lambda_class=cfg.lambda_class)
     multi_heatmap_loss_fn = MultiHeatmapLoss(lambda_class=cfg.lambda_class)
@@ -735,7 +742,7 @@ def main() -> None:
                 sweep_loader = _build_sweep_loader(
                     cfg, img_size, device,
                     num_shapes_range=(n, n),
-                    shape_size_range=train_kwargs["shape_size_range"],
+                    shape_size_range=cfg.val.shape_size_range,
                     label=f"count={n}",
                 )
                 vm_n = (
@@ -756,7 +763,7 @@ def main() -> None:
             for lo, hi in cfg.val_shape_sizes:
                 sweep_loader = _build_sweep_loader(
                     cfg, img_size, device,
-                    num_shapes_range=train_kwargs["num_shapes_range"],
+                    num_shapes_range=cfg.val.num_shapes_range,
                     shape_size_range=(lo, hi),
                     label=f"size={lo}-{hi}",
                 )
@@ -779,8 +786,8 @@ def main() -> None:
             for ov in cfg.val_overlaps:
                 sweep_loader = _build_sweep_loader(
                     cfg, img_size, device,
-                    num_shapes_range=train_kwargs["num_shapes_range"],
-                    shape_size_range=train_kwargs["shape_size_range"],
+                    num_shapes_range=cfg.val.num_shapes_range,
+                    shape_size_range=cfg.val.shape_size_range,
                     label=f"overlap={ov:.2f}",
                     max_overlap=ov,
                 )

@@ -70,6 +70,67 @@ class TestMultiObjectGlobals:
         assert m.matched_class_accuracy == 1.0
         assert m.cardinality_error == 0.0
 
+    def test_map_center_is_confidence_threshold_independent(self):
+        """map_center is now a confidence-integrated AP, so it must not change
+        when the at-threshold confidence cutoff changes (that cutoff only
+        affects the diagnostic precision_at/recall_at)."""
+        preds = torch.tensor([[
+            [0.50, 0.50, 0.90, 1.0, 0.0, 0.0],
+            [0.30, 0.70, 0.40, 0.0, 1.0, 0.0],   # correct but mid confidence
+            [0.10, 0.10, 0.20, 0.0, 0.0, 1.0],   # spurious, low confidence
+        ]])
+        gt_centers = [torch.tensor([[0.50, 0.50], [0.30, 0.70]])]
+        m_lo = evaluate_multi_object(
+            preds, gt_centers, image_size=(256, 256), confidence_threshold=0.1,
+        )
+        m_hi = evaluate_multi_object(
+            preds, gt_centers, image_size=(256, 256), confidence_threshold=0.5,
+        )
+        assert m_lo.map_center == pytest.approx(m_hi.map_center)
+        # The at-threshold recall SHOULD differ (0.5 drops the 0.40 detection).
+        assert m_hi.recall_at[2] < m_lo.recall_at[2]
+
+    def test_map_center_tie_order_independent(self):
+        """One TP and one far FP at the SAME confidence must give the same AP
+        regardless of input order (pessimistic tie-break: 0.5, not 1.0)."""
+        tp = [0.50, 0.50, 0.7, 1.0, 0.0, 0.0]   # on the GT
+        fp = [0.05, 0.05, 0.7, 1.0, 0.0, 0.0]   # far from the GT, same conf
+        gt = [torch.tensor([[0.50, 0.50]])]
+        m_tp_first = evaluate_multi_object(torch.tensor([[tp, fp]]), gt, image_size=(256, 256))
+        m_fp_first = evaluate_multi_object(torch.tensor([[fp, tp]]), gt, image_size=(256, 256))
+        assert m_tp_first.map_center == pytest.approx(m_fp_first.map_center)
+        assert m_tp_first.map_center == pytest.approx(0.5)
+
+    def test_map_center_perfect_is_one(self):
+        preds = torch.tensor([[
+            [0.50, 0.50, 0.9, 1.0, 0.0, 0.0],
+            [0.30, 0.70, 0.9, 0.0, 1.0, 0.0],
+        ]])
+        gt_centers = [torch.tensor([[0.50, 0.50], [0.30, 0.70]])]
+        m = evaluate_multi_object(preds, gt_centers, image_size=(256, 256))
+        assert m.map_center == pytest.approx(1.0)
+
+    def test_map_center_penalizes_false_positives(self):
+        """A model that nails both GTs but also emits many higher-confidence
+        spurious detections: matched_* metrics look perfect, but the AP must
+        drop because the false positives outrank the true positives."""
+        real = [
+            [0.50, 0.50, 0.60, 1.0, 0.0, 0.0],
+            [0.30, 0.70, 0.60, 0.0, 1.0, 0.0],
+        ]
+        spurious = [
+            [0.05 + 0.1 * i, 0.05, 0.90, 1.0, 0.0, 0.0] for i in range(8)
+        ]
+        preds = torch.tensor([real + spurious])
+        gt_centers = [torch.tensor([[0.50, 0.50], [0.30, 0.70]])]
+        m = evaluate_multi_object(
+            preds, gt_centers, image_size=(256, 256), confidence_threshold=0.1,
+        )
+        # Matched-only localization is blind to the false positives.
+        assert m.median_matched_center_px == 0.0
+        # The AP sees the higher-confidence false positives and drops well below 1.
+        assert m.map_center < 0.5
+
     def test_empty_gt_with_false_positives(self):
         preds = torch.tensor([[
             [0.5, 0.5, 0.9, 1.0, 0.0, 0.0],

@@ -1,0 +1,27 @@
+# Robustness-to-noise study: train on clean images, validate on noisy ones to
+# measure the clean->noisy degradation. Uses the CPU path because additive
+# noise (and textures/outlines) aren't supported by the GPU rasterizer.
+#
+#   python -m scripts.run_training --config configs/train_clean_eval_noisy.yaml
+#
+# To show that training-time noise augmentation helps, set train.add_noise:true
+# and rerun — the val number should recover.
+
+task: multi_heatmap
+encoder: simple_gn
+gpu_data: false
+epochs: 1000
+batch_size: 100
+image_size: 256
+lr: 1.0e-4
+max_objects: 10
+num_train_images: 1000
+num_val_images: 500
+
+train:
+  num_shapes_range: [0, 5]
+  shape_size_range: [20, 90]
+  add_noise: false          # <-- clean training images
+
+val:
+  add_noise: true           # <-- noisy validation images

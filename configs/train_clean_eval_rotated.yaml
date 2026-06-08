@@ -1,0 +1,28 @@
+# Rotation distribution-shift study (the headline example):
+# train on shapes WITHOUT rotation, validate WITH rotation, and watch the gap.
+# Because val is evaluated every epoch, the train-vs-rotated-val curve is the
+# study — no separate eval step needed.
+#
+#   python -m scripts.run_training --config configs/train_clean_eval_rotated.yaml
+#
+# To then CLOSE the gap, flip train.rotate_shapes to true and rerun: that is
+# "apply the rotation augmentation and retest" — same file, one line changed.
+
+task: heatmap
+encoder: simple_gn
+gpu_data: true            # solid + filled, so the fast GPU path is fine
+epochs: 1000
+batch_size: 100
+image_size: 256
+lr: 1.0e-4
+heatmap_stride: 1
+num_train_images: 1000
+num_val_images: 1000
+
+train:
+  num_shapes_range: [1, 1]
+  shape_size_range: [20, 128]
+  rotate_shapes: false      # <-- trained on axis-aligned shapes only
+
+val:
+  rotate_shapes: true       # <-- measured on rotated shapes (everything else inherits train)

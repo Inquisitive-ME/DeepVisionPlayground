@@ -70,6 +70,42 @@ python -m scripts.benchmark_models --epochs 300
 
 TensorBoard: `tensorboard --logdir runs`.
 
+## Distribution-shift studies
+
+The point of the sandbox is to train on one distribution and measure on
+another. A study is **declared in a config file**: run/model scalars at the
+top level, and `train:` / `val:` blocks that each set any dataset knob
+(rotation, noise, background, outline, sizes, counts, shape types, overlap).
+`val` inherits `train` and overrides only what shifts — there are no
+per-augmentation CLI flags to memorize, and the study is reproducible from one
+file. See `configs/` for the schema and worked examples.
+
+```bash
+# Train WITHOUT rotation, validate WITH it (the val set is the shift):
+python -m scripts.run_training --config configs/train_clean_eval_rotated.yaml
+```
+
+```yaml
+# configs/train_clean_eval_rotated.yaml (excerpt)
+task: heatmap
+train:
+  rotate_shapes: false   # trained on axis-aligned shapes
+val:
+  rotate_shapes: true    # measured on rotated shapes; everything else inherits train
+```
+
+Because `val` is evaluated every epoch, the train-vs-shifted-val curve *is* the
+study. To then close the gap, flip `train.rotate_shapes` to `true` and rerun.
+
+Two other ways to run a shift study:
+
+- **Post-hoc sweeps** — `scripts.eval_sweep` loads a saved model and sweeps one
+  val-time perturbation across several values, holding everything else at the
+  model's training distribution:
+  `python -m scripts.eval_sweep --run-dir runs/<run> --rotate false,true --noise false,true`.
+- **By hand in Python** — `examples/clean_train_rotated_val.py` composes the
+  train/val datasets and loop directly, for full control without a config.
+
 ## How the task is set up
 
 Each image is an RGB canvas (default 256×256) drawn from
@@ -98,9 +134,15 @@ For heatmaps: `--heatmap-stride 4` is fastest, `1` is exact-pixel.
 
 ## Encoders
 
-- `simple` / `simple_bn`: 4-conv stack, stride 16, 128 final channels.
-- `simple_gap` / `simple_bn_gap`: same but global-average-pooled. Position-
-  invariant, only useful for classification, not localization.
+- `simple_gn` (**default**) / `simple` / `simple_bn`: 4-conv stack, stride 16,
+  128 final channels. `simple_gn` uses GroupNorm, which is per-sample and so
+  behaves identically in train and eval — the right choice for honest
+  distribution-shift studies. `simple_bn` (BatchNorm) and the `resnet*`
+  encoders carry running statistics that are frozen at eval, which biases
+  predictions on shifted val data; **don't use them for robustness or
+  "which component is necessary" comparisons.**
+- `simple_gn_gap` / `simple_gap` / `simple_bn_gap`: same but global-average-
+  pooled. Position-invariant, only useful for classification, not localization.
 - `resnet18` / `resnet34`: torchvision backbones, GAP'd. Same caveat.
 - `resnet18_spatial` / `resnet34_spatial`: torchvision backbones with the
   AvgPool stripped, ~32 K spatial features.
@@ -120,7 +162,10 @@ Reported per training run via `--task heatmap` and `multi_heatmap`:
 - **`accuracy`** (single) / **`matched_class_accuracy`** (multi): classification
   on the matched / per-image prediction.
 - **`recall@T px`** at thresholds {2, 4, 8, 16}: detection rate.
-- **`map_center`**: mean of `precision*recall` across pixel thresholds.
+- **`map_center`**: confidence-integrated average precision (area under the
+  precision–recall curve, averaged over pixel thresholds). Independent of the
+  confidence threshold, so it is comparable across model families (e.g. FC
+  multi vs heatmap, whose raw confidence scores live on different scales).
 - **`by_size/{xs,sm,md,lg}/...`**: same metrics restricted to GT shapes
   in each size bucket.
 - **`by_count/{n1,n2,n3-5,...}/...`**: restricted to images with n GTs.

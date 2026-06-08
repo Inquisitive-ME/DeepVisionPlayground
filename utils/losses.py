@@ -11,10 +11,19 @@ class CenterPredictionLoss(nn.Module):
                  model_type: ModelType,
                  lambda_conf: float = 1.0,
                  lambda_class: float = 1.0,
+                 class_match_weight: float = 0.1,
                  ):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_class = lambda_class
+        # Weight of the class term INSIDE the Hungarian matching cost — kept
+        # separate from lambda_class (which weights the supervised class loss).
+        # Centers are normalized to [0, 1], so the geometric cdist between
+        # distinct objects is ~0.1 while the class cost (-prob) spans ~1.0.
+        # If the class term were weighted at lambda_class=1.0 it would dominate
+        # matching and flip spatially-correct assignments; a small weight lets
+        # class only break ties between near-coincident objects.
+        self.class_match_weight = class_match_weight
         self.model_type = model_type
 
     def forward(self, pred, target_centers, target_classes=None):
@@ -60,7 +69,7 @@ class CenterPredictionLoss(nn.Module):
                 # correct class (DETR-style class cost: -prob[target]).
                 pred_probs = F.softmax(pred_classes, dim=-1)
                 class_cost = -pred_probs[:, target_classes_torch]
-                cost_matrix = cost_matrix + self.lambda_class * class_cost
+                cost_matrix = cost_matrix + self.class_match_weight * class_cost
 
             pred_indices_np, gt_indices_np = linear_sum_assignment(
                 cost_matrix.detach().cpu().numpy()
