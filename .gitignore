@@ -5,3 +5,17 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Training run outputs (TensorBoard event files, model.pth, results.json)
+runs/
+
+# Model checkpoints
+*.pth
+
+# Generated fixed datasets (ShapeDataset fixed_dataset save_location)
+shape_dataset/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
