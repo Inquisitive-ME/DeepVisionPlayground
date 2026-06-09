@@ -128,6 +128,32 @@ def test_center_predictor_eval_matches_train_mode():
     assert torch.allclose(out_train, out_eval, atol=1e-5)
 
 
+@pytest.mark.parametrize("encoder_type, expected_features", [
+    (EncodeType.simple, 128 * 16 * 16),
+    (EncodeType.simple_gn, 128 * 16 * 16),
+    (EncodeType.resnet18_spatial, 512 * 8 * 8),
+])
+@pytest.mark.parametrize("img", [64, 128, 256])
+def test_spatial_encoder_is_size_agnostic(encoder_type, expected_features, img):
+    """The spatial-flatten encoders pin their grid via AdaptiveAvgPool, so the
+    flattened feature size is fixed at any input size (256px is the no-op case)."""
+    model, sz = encoder(encoder_type)
+    assert sz == expected_features
+    out = model(torch.randn(1, 3, img, img))
+    assert out.shape == (1, expected_features)
+
+
+def test_simple_center_net_runs_at_non_256_input():
+    # Previously the flatten head was hardcoded for 256px and crashed otherwise.
+    model = SimpleCenterNet(
+        num_classes=3,
+        encoder_type=EncodeType.simple_gn,
+        model_type=ModelType.center_localization_and_class_id,
+    )
+    out = model(torch.randn(2, 3, 128, 128))
+    assert out.shape == (2, 5)
+
+
 def test_unknown_model_type_raises():
     with pytest.raises(ValueError):
         SimpleCenterNet(
