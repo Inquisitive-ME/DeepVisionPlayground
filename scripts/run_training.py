@@ -34,12 +34,19 @@ from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
 from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
+from models.seg_net import ShapeSegNet
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
 from utils.heatmap_loss import HeatmapLoss, MultiHeatmapLoss
 from utils.losses import CenterPredictionLoss
-from utils.metrics import evaluate_multi_object, evaluate_single_object
+from utils.metrics import (
+    evaluate_multi_object,
+    evaluate_segmentation,
+    evaluate_single_object,
+    segmentation_confusion,
+)
 from utils.perf import configure_for_speed, pick_device
+from utils.seg_loss import SegLoss
 from utils.training_logger import TrainingLogger
 
 
@@ -72,6 +79,7 @@ class RunConfig:
     lambda_conf: float = 1.0
     class_match_weight: float = 0.1
     heatmap_stride: int = 4
+    seg_stride: int = 1
     val_shape_counts: tuple[int, ...] = ()
     val_shape_sizes: tuple[tuple[int, int], ...] = ()
     val_overlaps: tuple[float, ...] = ()
@@ -97,7 +105,7 @@ def parse_args() -> RunConfig:
     )
     p.add_argument(
         "--task",
-        choices=("single", "multi", "heatmap", "multi_heatmap"),
+        choices=("single", "multi", "heatmap", "multi_heatmap", "segmentation"),
         default="single",
     )
     p.add_argument(
@@ -160,6 +168,14 @@ def parse_args() -> RunConfig:
         help=(
             "Output stride for heatmap models. 4 = 64x64 heatmap on 256-px input, "
             "fast and ~2-3 px median error. 2 = 128x128, sub-pixel error. 1 = 256x256."
+        ),
+    )
+    p.add_argument(
+        "--seg-stride", type=int, default=1,
+        help=(
+            "Output stride for the segmentation model (--task segmentation). "
+            "1 = full-resolution masks (the target for mIoU->1.0); larger is "
+            "cheaper and upsampled for the loss/metric."
         ),
     )
     p.add_argument(
@@ -228,6 +244,7 @@ def parse_args() -> RunConfig:
         lambda_conf=args.lambda_conf,
         class_match_weight=args.class_match_weight,
         heatmap_stride=args.heatmap_stride,
+        seg_stride=args.seg_stride,
         val_shape_counts=val_shape_counts,
         val_shape_sizes=tuple(val_shape_sizes),
         val_overlaps=val_overlaps,
@@ -514,6 +531,30 @@ def evaluate_single(model, loader, device, image_size):
     return metrics.to_dict()
 
 
+def evaluate_seg(model, loader, device, num_classes, class_names):
+    """Accumulate a confusion matrix over the val set, then mIoU / pixel-acc.
+
+    Predictions are upsampled to the GT mask resolution so the score is at full
+    resolution regardless of the model's output stride.
+    """
+    model.eval()
+    k = num_classes + 1  # + background
+    conf = torch.zeros((k, k), dtype=torch.long)
+    with torch.no_grad():
+        for batch in loader:
+            images, masks = batch[0], batch[2]
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
+            pred = model.decode(model(images))  # (B, h, w) at the output stride
+            if pred.shape[-2:] != masks.shape[-2:]:
+                pred = F.interpolate(
+                    pred.unsqueeze(1).float(), size=masks.shape[-2:], mode="nearest",
+                ).squeeze(1).long()
+            conf += segmentation_confusion(pred, masks.to(pred.device), k)
+    metrics = evaluate_segmentation(conf, class_names=class_names + ("background",))
+    return metrics.to_dict()
+
+
 def main() -> None:
     cfg = parse_args()
     configure_for_speed()
@@ -533,6 +574,8 @@ def main() -> None:
     # train-on-rect+circle / test-on-triangle keeps consistent indices).
     num_classes = len(ShapeType)
     class_names = tuple(s.name for s in ShapeType)
+    # Segmentation needs per-pixel label maps from the loaders.
+    need_masks = cfg.task == "segmentation"
 
     if cfg.gpu_data:
         if device.type != "cuda":
@@ -541,23 +584,24 @@ def main() -> None:
             train_dc, batch_size=cfg.batch_size, num_images=cfg.num_train_images,
             image_size=img_size, seed=train_seed, device=device,
             reseed_each_epoch=False,  # train draws fresh data every epoch
+            with_masks=need_masks,
         )
         # Val must be a FIXED dataset across epochs (reseed_each_epoch=True), or
         # the val metric is computed on different data every epoch.
         val_loader: Any = build_gpu_loader(
             val_dc, batch_size=cfg.batch_size, num_images=cfg.num_val_images,
             image_size=img_size, seed=cfg.val_seed, device=device,
-            reseed_each_epoch=True,
+            reseed_each_epoch=True, with_masks=need_masks,
         )
     else:
         pin_memory = device.type == "cuda"
         train_dataset = build_cpu_dataset(
             train_dc, num_images=cfg.num_train_images, image_size=img_size,
-            seed=train_seed, transform=transform,
+            seed=train_seed, transform=transform, with_masks=need_masks,
         )
         val_dataset = build_cpu_dataset(
             val_dc, num_images=cfg.num_val_images, image_size=img_size,
-            seed=cfg.val_seed, transform=transform,
+            seed=cfg.val_seed, transform=transform, with_masks=need_masks,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.batch_size, shuffle=True,
@@ -580,6 +624,8 @@ def main() -> None:
         model = CenterHeatmapNet(num_classes=num_classes, stride=cfg.heatmap_stride)
     elif cfg.task == "multi_heatmap":
         model = MultiHeatmapNet(num_classes=num_classes, stride=cfg.heatmap_stride)
+    elif cfg.task == "segmentation":
+        model = ShapeSegNet(num_classes=num_classes, stride=cfg.seg_stride)
     else:
         model = CenterPredictor(
             num_classes=num_classes,
@@ -600,6 +646,7 @@ def main() -> None:
     )
     heatmap_loss_fn = HeatmapLoss(lambda_class=cfg.lambda_class)
     multi_heatmap_loss_fn = MultiHeatmapLoss(lambda_class=cfg.lambda_class)
+    seg_loss_fn = SegLoss()
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     run_name = f"{cfg.task}_{cfg.encoder}_{img_size[0]}_bs{cfg.batch_size}"
@@ -620,7 +667,9 @@ def main() -> None:
                 "loss": 0.0, "mse_centers": 0.0, "ce_class": 0.0,
                 "hm_heatmap": 0.0, "hm_offset": 0.0, "hm_class": 0.0,
             }
-            for images, anns in train_loader:
+            for batch in train_loader:
+                images, anns = batch[0], batch[1]
+                masks = batch[2] if len(batch) == 3 else None
                 if images.device != device:
                     images = images.to(device, non_blocking=True)
                 if cfg.task == "single":
@@ -677,6 +726,12 @@ def main() -> None:
                     sums["hm_heatmap"] += float(terms.heatmap.detach()) * images.size(0)
                     sums["hm_offset"] += float(terms.offset.detach()) * images.size(0)
                     sums["hm_class"] += float(terms.class_.detach()) * images.size(0)
+                elif cfg.task == "segmentation":
+                    assert masks is not None
+                    if masks.device != device:
+                        masks = masks.to(device, non_blocking=True)
+                    out = model(images)
+                    loss = seg_loss_fn(out, masks)
                 else:
                     centers_list, classes_list, _ = build_targets_multi(anns, device)
                     out = model(images)
@@ -711,12 +766,14 @@ def main() -> None:
                 vm = evaluate_multi_heatmap(
                     model, val_loader, device, img_size, class_names, cfg.max_objects,
                 )
+            elif cfg.task == "segmentation":
+                vm = evaluate_seg(model, val_loader, device, num_classes, class_names)
             else:
                 vm = evaluate_multi(model, val_loader, device, img_size, class_names)
             logger.log_metrics(vm, step=epoch)
             final_metrics = vm
 
-            interesting_substrings = ("_px", "accuracy", "map", "pearson")
+            interesting_substrings = ("_px", "accuracy", "map", "pearson", "miou", "pixel_acc")
             extras = ", ".join(
                 f"{k.split('/')[-1]}={v:.3f}"
                 for k, v in vm.items()
