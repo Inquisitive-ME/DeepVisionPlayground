@@ -75,10 +75,11 @@ class DatasetConfig:
         cls, task: str, num_shapes_range: tuple[int, int] | None = None
     ) -> "DatasetConfig":
         """The historical per-task training distribution, used when no study
-        config is supplied. Single-object tasks see one rotated shape spanning
-        a wide size range; multi-object tasks see a variable count, no rotation.
+        config is supplied. Single-object tasks (and classification) see one
+        rotated shape spanning a wide size range; multi-object and segmentation
+        tasks see a variable count, no rotation.
         """
-        if task in ("single", "heatmap"):
+        if task in ("single", "heatmap", "classification"):
             return cls(num_shapes_range=(1, 1), shape_size_range=(20, 128), rotate_shapes=True)
         return cls(
             num_shapes_range=num_shapes_range or (0, 3),
@@ -113,6 +114,7 @@ def build_cpu_dataset(
     image_size: tuple[int, int],
     seed: int | None,
     transform: Any,
+    with_masks: bool = False,
 ) -> Any:
     """Build a CPU ``ShapeDataset`` from a DatasetConfig."""
     from data.synthetic_shapes_dataset import ShapeDataset
@@ -130,6 +132,7 @@ def build_cpu_dataset(
         max_overlap=cfg.max_overlap,
         add_noise=cfg.add_noise,
         transform=transform,
+        with_masks=with_masks,
     )
 
 
@@ -142,6 +145,7 @@ def build_gpu_loader(
     seed: int | None,
     device: Any,
     reseed_each_epoch: bool = False,
+    with_masks: bool = False,
 ) -> Any:
     """Build a GPU ``GpuShapeLoader`` from a DatasetConfig.
 
@@ -176,4 +180,5 @@ def build_gpu_loader(
         max_overlap=cfg.max_overlap,
         device=device,
         reseed_each_epoch=reseed_each_epoch,
+        with_masks=with_masks,
     )

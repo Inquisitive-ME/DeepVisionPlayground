@@ -44,6 +44,8 @@ from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
 from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
+from models.seg_net import ShapeSegNet
+from models.shape_classifier import ShapeClassifier
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
 
@@ -116,6 +118,10 @@ def _load_run(run_dir: Path) -> tuple[torch.nn.Module, dict[str, Any], _ValDefau
         model = MultiHeatmapNet(
             num_classes=num_classes, stride=int(cfg["heatmap_stride"]),
         )
+    elif cfg["task"] == "segmentation":
+        model = ShapeSegNet(num_classes=num_classes, stride=int(cfg.get("seg_stride", 1)))
+    elif cfg["task"] == "classification":
+        model = ShapeClassifier(num_classes=num_classes, encoder_type=encoder_type)
     else:  # multi
         model = CenterPredictor(
             num_classes=num_classes,
@@ -158,6 +164,7 @@ def _build_loader(d: _ValDefaults, device: torch.device) -> Any:
     ds = build_cpu_dataset(
         d.dataset, num_images=d.num_val_images, image_size=d.image_size,
         seed=d.val_seed, transform=transforms.ToTensor(),
+        with_masks=d.task == "segmentation",
     )
     return DataLoader(
         ds, batch_size=d.batch_size, shuffle=False,
@@ -171,12 +178,16 @@ def _evaluate(model: torch.nn.Module, loader: Any, defaults: _ValDefaults,
     """Run the right evaluator for the model's task."""
     # Lazy imports keep the module tree decoupled in the docstring.
     from scripts.run_training import (
+        evaluate_classification,
         evaluate_heatmap,
         evaluate_multi,
         evaluate_multi_heatmap,
+        evaluate_seg,
         evaluate_single,
     )
     class_names = tuple(s.name for s in ShapeType)
+    if defaults.task == "classification":
+        return evaluate_classification(model, loader, device)
     if defaults.task == "single":
         return evaluate_single(model, loader, device, defaults.image_size)
     if defaults.task == "heatmap":
@@ -185,6 +196,8 @@ def _evaluate(model: torch.nn.Module, loader: Any, defaults: _ValDefaults,
         return evaluate_multi_heatmap(
             model, loader, device, defaults.image_size, class_names, defaults.max_objects,
         )
+    if defaults.task == "segmentation":
+        return evaluate_seg(model, loader, device, len(ShapeType), class_names)
     return evaluate_multi(model, loader, device, defaults.image_size, class_names)
 
 
@@ -197,15 +210,27 @@ def _sweep(model: torch.nn.Module, defaults: _ValDefaults, device: torch.device,
         # Override just the swept field(s) of the baseline distribution.
         from dataclasses import replace
         d = replace(defaults, dataset=defaults.dataset.merged(overrides))
-        loader = _build_loader(d, device)
+        try:
+            loader = _build_loader(d, device)
+        except NotImplementedError as e:
+            # e.g. a segmentation model (needs masks) swept over outlines, which
+            # the mask path doesn't support yet. Skip the point, don't abort.
+            print(f"  {label:>20s}: skipped ({e})")
+            continue
         vm = _evaluate(model, loader, d, device)
         # Pick the right metric subset for the task.
-        is_multi = defaults.task in ("multi", "multi_heatmap")
-        med = vm.get("multi/median_matched_center_px" if is_multi else "single/median_center_px", 0.0)
-        mean = vm.get("multi/mean_matched_center_px" if is_multi else "single/mean_center_px", 0.0)
-        acc = vm.get("multi/matched_class_accuracy" if is_multi else "single/accuracy", 0.0)
-        pcx = vm.get("multi/pearson_cx" if is_multi else "single/pearson_cx", 0.0)
-        print(f"  {label:>20s}: median_px={med:6.2f}  mean_px={mean:6.2f}  acc={acc:.3f}  pearson_cx={pcx:.3f}")
+        if defaults.task == "segmentation":
+            print(f"  {label:>20s}: mIoU={vm.get('seg/miou', 0.0):.3f}  "
+                  f"pixel_acc={vm.get('seg/pixel_acc', 0.0):.3f}")
+        elif defaults.task == "classification":
+            print(f"  {label:>20s}: accuracy={vm.get('classification/accuracy', 0.0):.3f}")
+        else:
+            is_multi = defaults.task in ("multi", "multi_heatmap")
+            med = vm.get("multi/median_matched_center_px" if is_multi else "single/median_center_px", 0.0)
+            mean = vm.get("multi/mean_matched_center_px" if is_multi else "single/mean_center_px", 0.0)
+            acc = vm.get("multi/matched_class_accuracy" if is_multi else "single/accuracy", 0.0)
+            pcx = vm.get("multi/pearson_cx" if is_multi else "single/pearson_cx", 0.0)
+            print(f"  {label:>20s}: median_px={med:6.2f}  mean_px={mean:6.2f}  acc={acc:.3f}  pearson_cx={pcx:.3f}")
         results[label] = vm
     return results
 

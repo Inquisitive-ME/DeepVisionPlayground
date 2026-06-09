@@ -157,8 +157,22 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                  max_overlap: float = 0.6,
                  transform: Optional[Callable[[Any], Any]] = None,
                  save_location: str = "shape_dataset",
-                 seed: Optional[int] = None,):
+                 seed: Optional[int] = None,
+                 with_masks: bool = False,):
         validate_shape_size_range(image_size, shape_size_range)
+        if with_masks and shape_outline != ShapeOutline.FILL:
+            # Outline-only shapes leave their interior background-colored, so a
+            # filled mask wouldn't match the image. v1 segmentation masks
+            # therefore require filled shapes (also the GPU path's only mode).
+            raise NotImplementedError(
+                "with_masks currently requires shape_outline=FILL "
+                f"(got {shape_outline}); outlined-shape masks aren't supported yet."
+            )
+        if with_masks and fixed_dataset:
+            # The fixed-dataset cache only stores (img, annotations); masks
+            # aren't persisted, so a cached item would return a None mask.
+            raise NotImplementedError("with_masks is not supported with fixed_dataset=True")
+        self.with_masks = with_masks
         self.num_images = num_images
         self.image_size = image_size
         self.num_shapes_range = num_shapes_range
@@ -210,7 +224,7 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 os.makedirs(images_path, exist_ok=True)
                 os.makedirs(annotations_path, exist_ok=True)
                 for i in range(num_images):
-                    img, annotations = self.generate_image()
+                    img, annotations, _ = self.generate_image()
                     self.data.append((img, annotations))
                     img.save(os.path.join(images_path, f"{i}.png"))
                     with open(os.path.join(annotations_path, f'{i}.json'), 'w') as f:
@@ -219,7 +233,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
     def __len__(self) -> int:
         return self.num_images
 
-    def __getitem__(self, idx: int) -> tuple[Image.Image | torch.Tensor, list[Annotation]]:
+    def __getitem__(self, idx: int) -> tuple[Any, ...]:
+        mask: Optional[torch.Tensor] = None
         if self.fixed_dataset:
             img, ann = self.data[idx]
         else:
@@ -233,16 +248,22 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 per_idx_seed = (self._seed + int(idx)) & 0xFFFFFFFF
                 self._rng = random.Random(per_idx_seed)
                 self._np_rng = np.random.default_rng(per_idx_seed)
-            img, ann = self.generate_image()
+            img, ann, mask = self.generate_image()
         if self.transform:
             img = self.transform(img)
+        if self.with_masks:
+            return img, ann, mask
         return img, ann
 
     @staticmethod
-    def collate_function(batch: list[tuple[torch.Tensor, dict[Any, Any]]]
-                         ) -> tuple[torch.Tensor, list[list[dict[Any, Any]]]]:
-        # Each batch item is a tuple: (image, annotations)
-        images, annotations = zip(*batch)
+    def collate_function(batch: list[tuple[Any, ...]]) -> tuple[Any, ...]:
+        # Each batch item is (image, annotations) or, with masks,
+        # (image, annotations, mask).
+        has_masks = len(batch[0]) == 3
+        if has_masks:
+            images, annotations, masks = zip(*batch)
+        else:
+            images, annotations = zip(*batch)
 
         # Convert images using the default collate function (they're tensors)
         images = default_collate(images)
@@ -259,6 +280,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
         for ann in annotations:
             new_annotations.append([annotation_to_dict(a) for a in ann])
 
+        if has_masks:
+            return images, new_annotations, torch.stack(list(masks))
         return images, new_annotations
 
     @staticmethod
@@ -307,7 +330,9 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
         return (int(round(center[0] * self.image_size[0])),
                 int(round(center[1] * self.image_size[1])))
 
-    def generate_image(self) -> tuple[Image.Image, list[Annotation]]:
+    def generate_image(
+        self,
+    ) -> tuple[Image.Image, list[Annotation], Optional[torch.Tensor]]:
         rng = self._rng
         np_rng = self._np_rng
 
@@ -335,6 +360,9 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
 
         num_shapes = rng.randint(*self.num_shapes_range)
         existing_boxes: list[BoundingBox] = []
+        # (draw-primitive, coords, class) per shape, for the segmentation label
+        # map. Recorded in draw order and rendered onto a label canvas below.
+        mask_specs: list[tuple[str, Any, int]] = []
         for _ in range(num_shapes):
             shape_type = rng.choice(self.shape_types)
             shape_color = select_shape_color(bg_color, rng=rng)
@@ -378,6 +406,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                     corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
                     center = ((x0 + x1) / 2, (y0 + y1) / 2)
                     rotated_corners, bbox = self.rotate_shape_points(corners, center)
+                    if self.with_masks:
+                        mask_specs.append(("polygon", rotated_corners, shape_type.value))
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                         draw.polygon(
                             rotated_corners,
@@ -390,6 +420,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                             width=outline_width
                         )
                 else:
+                    if self.with_masks:
+                        mask_specs.append(("rectangle", list(bbox), shape_type.value))
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                         draw.rectangle(
                             bbox,
@@ -402,6 +434,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                             width=outline_width
                         )
             elif shape_type == ShapeType.CIRCLE:
+                if self.with_masks:
+                    mask_specs.append(("ellipse", list(bbox), shape_type.value))
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                     draw.ellipse(
                         bbox,
@@ -424,6 +458,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 )
                 if self.rotate_shapes:
                     points, bbox = self.rotate_shape_points(points, center)
+                if self.with_masks:
+                    mask_specs.append(("polygon", points, shape_type.value))
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                     draw.polygon(
                         points,
@@ -447,7 +483,18 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
         if self.add_noise:
             img = add_gaussian_noise(img, np_rng=np_rng)
 
-        return img, annotations
+        label = None
+        if self.with_masks:
+            # Render the recorded shapes (filled with their class) onto a label
+            # canvas in the same draw order, so the mask matches the image
+            # pixel-for-pixel including overlaps. Background = len(ShapeType).
+            label_img = Image.new("L", self.image_size, len(ShapeType))
+            label_draw = ImageDraw.Draw(label_img)
+            for kind, coords, cls in mask_specs:
+                getattr(label_draw, kind)(coords, fill=cls)
+            label = torch.from_numpy(np.array(label_img, dtype=np.int64))  # (H, W)
+
+        return img, annotations, label
 
     def get_classes(self) -> list[str]:
         """

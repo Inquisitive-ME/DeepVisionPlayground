@@ -14,13 +14,14 @@ This repo gives you:
 
 - A **synthetic shape generator** with knobs for shape type, size, count,
   rotation, color, background, and overlap. Generates fresh data per epoch
-  on the GPU so you never overfit and never wait on the dataloader.
-- **Four model families** for center-based detection, ranging from a
-  ~400 K-parameter heatmap predictor to a ResNet18-backbone variant —
-  with a clean `--task` switch between them.
-- **Real metrics**: per-pixel-threshold precision/recall, per-class breakdowns,
-  per-shape-size buckets, per-image-density buckets, Pearson correlation
-  between predicted and true positions, and a `map_center` summary.
+  on the GPU so you never overfit and never wait on the dataloader — and emits
+  pixel-perfect segmentation masks for free (the generator is the labeller).
+- **Six tasks** behind one `--task` switch: center detection (`single`,
+  `multi`, `heatmap`, `multi_heatmap`), semantic `segmentation`, and whole-image
+  `classification` — covering localize / classify / segment from the vision.
+- **Real metrics** per task: detection P/R + `map_center` AP (with per-class,
+  per-size, per-density breakdowns and Pearson), segmentation mIoU / per-class
+  IoU / pixel accuracy, and classification accuracy.
 - **Post-training sweeps**: take one trained model, eval it against a grid
   of (shape count, shape size) val sets, and read the failure landscape.
 - **Real benchmarking infrastructure**: a CLI driver, a pytest harness, a
@@ -126,16 +127,33 @@ Every shape has random:
 
 Backgrounds are random solid colors.
 
-## Model families
+## Tasks (`--task`)
 
-| `--task` | Model | What it predicts |
-|---|---|---|
-| `single` | `SimpleCenterNet` (FC regression) | One `(cx, cy, class_logits)` per image. Fast but capped by encoder stride. |
-| `multi` | `CenterPredictor` (FC + slots) | `max_objects` `(cx, cy, conf, class_logits)` slots, Hungarian-matched to GT. |
-| `heatmap` | `CenterHeatmapNet` | Per-pixel heatmap + offset + class. Sub-pixel localization via heatmap argmax + offset. |
-| `multi_heatmap` | `MultiHeatmapNet` | Same as heatmap but with top-K NMS decode for multi-object. |
+| `--task` | Model | What it predicts | Metric |
+|---|---|---|---|
+| `single` | `SimpleCenterNet` (FC regression) | One `(cx, cy, class)` per image. Fast but capped by encoder stride. | center px, accuracy |
+| `multi` | `CenterPredictor` (FC + slots) | `max_objects` `(cx, cy, conf, class)` slots, Hungarian-matched to GT. | `map_center` AP, matched px |
+| `heatmap` | `CenterHeatmapNet` | Per-pixel heatmap + offset + class. Sub-pixel localization via heatmap argmax + offset. | center px, accuracy |
+| `multi_heatmap` | `MultiHeatmapNet` | Same as heatmap but with top-K NMS decode for multi-object. | `map_center` AP, matched px |
+| `segmentation` | `ShapeSegNet` | Per-pixel class (background + each shape type). Encoder-decoder, argmax decode. | mIoU, per-class IoU, pixel acc |
+| `classification` | `ShapeClassifier` | The class of the single shape (no localization). Encoder + linear head. | accuracy |
 
-For heatmaps: `--heatmap-stride 4` is fastest, `1` is exact-pixel.
+For heatmaps: `--heatmap-stride 4` is fastest, `1` is exact-pixel. For
+segmentation: `--seg-stride 1` is full-resolution masks (target mIoU→1.0).
+
+```bash
+# Semantic segmentation (free pixel-perfect masks; ~400 K params):
+python -m scripts.run_training --task segmentation --gpu-data \
+    --epochs 500 --batch-size 100 --image-size 256 \
+    --num-shapes-min 1 --num-shapes-max 5 --seg-stride 1 --lr 1e-3
+
+# Whole-image shape classification (GAP encoder is ideal here):
+python -m scripts.run_training --task classification --gpu-data \
+    --encoder simple_gn_gap --epochs 200 --image-size 128
+```
+
+Instance segmentation is scoped (per-shape masks) but not yet built —
+see `docs/instance_segmentation_design.md`.
 
 ## Encoders
 
@@ -176,6 +194,14 @@ Reported per training run via `--task heatmap` and `multi_heatmap`:
 - **`by_count/{n1,n2,n3-5,...}/...`**: restricted to images with n GTs.
 
 `scripts/sweep_buckets.py runs/<run>` pretty-prints them.
+
+Segmentation (`--task segmentation`) instead reports:
+
+- **`seg/miou`**: mean IoU over the classes present (the "is it solved" number).
+- **`seg/iou/<class>`**: per-class IoU, including `background`.
+- **`seg/pixel_acc`**: fraction of correctly-classified pixels.
+
+Classification (`--task classification`) reports **`classification/accuracy`**.
 
 ## Layout
 

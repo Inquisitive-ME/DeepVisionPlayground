@@ -1,0 +1,26 @@
+# Zero-shot segmentation study: train on rectangles + circles only, then
+# segment a val set that ALSO contains triangles. The model always has a
+# triangle output channel (num_classes is fixed), so the question is: can it
+# segment a shape class it never saw at train time? Watch seg/iou/TRIANGLE
+# (expected: low) vs seg/iou/RECTANGLE and seg/iou/CIRCLE (expected: high).
+#
+#   python -m scripts.run_training --config configs/segment_zero_shot.yaml
+#
+# val inherits train; it only overrides shape_types to add triangles.
+
+task: segmentation
+gpu_data: true
+epochs: 500
+batch_size: 100
+image_size: 256
+lr: 1.0e-3
+seg_stride: 1
+num_train_images: 1000
+num_val_images: 500
+
+train:
+  num_shapes_range: [1, 4]
+  shape_types: [RECTANGLE, CIRCLE]            # triangles never seen in training
+
+val:
+  shape_types: [RECTANGLE, CIRCLE, TRIANGLE]  # triangles appear only at eval
