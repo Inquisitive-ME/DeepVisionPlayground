@@ -45,6 +45,7 @@ from models.encoders import EncodeType
 from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
 from models.seg_net import ShapeSegNet
+from models.shape_classifier import ShapeClassifier
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
 
@@ -119,6 +120,8 @@ def _load_run(run_dir: Path) -> tuple[torch.nn.Module, dict[str, Any], _ValDefau
         )
     elif cfg["task"] == "segmentation":
         model = ShapeSegNet(num_classes=num_classes, stride=int(cfg.get("seg_stride", 1)))
+    elif cfg["task"] == "classification":
+        model = ShapeClassifier(num_classes=num_classes, encoder_type=encoder_type)
     else:  # multi
         model = CenterPredictor(
             num_classes=num_classes,
@@ -175,6 +178,7 @@ def _evaluate(model: torch.nn.Module, loader: Any, defaults: _ValDefaults,
     """Run the right evaluator for the model's task."""
     # Lazy imports keep the module tree decoupled in the docstring.
     from scripts.run_training import (
+        evaluate_classification,
         evaluate_heatmap,
         evaluate_multi,
         evaluate_multi_heatmap,
@@ -182,6 +186,8 @@ def _evaluate(model: torch.nn.Module, loader: Any, defaults: _ValDefaults,
         evaluate_single,
     )
     class_names = tuple(s.name for s in ShapeType)
+    if defaults.task == "classification":
+        return evaluate_classification(model, loader, device)
     if defaults.task == "single":
         return evaluate_single(model, loader, device, defaults.image_size)
     if defaults.task == "heatmap":
@@ -210,6 +216,8 @@ def _sweep(model: torch.nn.Module, defaults: _ValDefaults, device: torch.device,
         if defaults.task == "segmentation":
             print(f"  {label:>20s}: mIoU={vm.get('seg/miou', 0.0):.3f}  "
                   f"pixel_acc={vm.get('seg/pixel_acc', 0.0):.3f}")
+        elif defaults.task == "classification":
+            print(f"  {label:>20s}: accuracy={vm.get('classification/accuracy', 0.0):.3f}")
         else:
             is_multi = defaults.task in ("multi", "multi_heatmap")
             med = vm.get("multi/median_matched_center_px" if is_multi else "single/median_center_px", 0.0)

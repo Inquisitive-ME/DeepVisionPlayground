@@ -75,10 +75,11 @@ class DatasetConfig:
         cls, task: str, num_shapes_range: tuple[int, int] | None = None
     ) -> "DatasetConfig":
         """The historical per-task training distribution, used when no study
-        config is supplied. Single-object tasks see one rotated shape spanning
-        a wide size range; multi-object tasks see a variable count, no rotation.
+        config is supplied. Single-object tasks (and classification) see one
+        rotated shape spanning a wide size range; multi-object and segmentation
+        tasks see a variable count, no rotation.
         """
-        if task in ("single", "heatmap"):
+        if task in ("single", "heatmap", "classification"):
             return cls(num_shapes_range=(1, 1), shape_size_range=(20, 128), rotate_shapes=True)
         return cls(
             num_shapes_range=num_shapes_range or (0, 3),

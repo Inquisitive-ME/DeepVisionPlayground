@@ -35,6 +35,7 @@ from models.encoders import EncodeType
 from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
 from models.seg_net import ShapeSegNet
+from models.shape_classifier import ShapeClassifier
 from models.simple_center_net import SimpleCenterNet
 from models.types import ModelType
 from utils.heatmap_loss import HeatmapLoss, MultiHeatmapLoss
@@ -105,7 +106,7 @@ def parse_args() -> RunConfig:
     )
     p.add_argument(
         "--task",
-        choices=("single", "multi", "heatmap", "multi_heatmap", "segmentation"),
+        choices=("single", "multi", "heatmap", "multi_heatmap", "segmentation", "classification"),
         default="single",
     )
     p.add_argument(
@@ -555,6 +556,23 @@ def evaluate_seg(model, loader, device, num_classes, class_names):
     return metrics.to_dict()
 
 
+def evaluate_classification(model, loader, device):
+    """Whole-image shape-classification accuracy (one shape per image)."""
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch in loader:
+            images, anns = batch[0], batch[1]
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
+            gt = torch.tensor([a[0]["shape"] for a in anns], dtype=torch.long, device=device)
+            pred = model(images).argmax(dim=1)
+            correct += int((pred == gt).sum())
+            total += gt.numel()
+    return {"classification/accuracy": correct / total if total else 0.0}
+
+
 def main() -> None:
     cfg = parse_args()
     configure_for_speed()
@@ -626,6 +644,8 @@ def main() -> None:
         model = MultiHeatmapNet(num_classes=num_classes, stride=cfg.heatmap_stride)
     elif cfg.task == "segmentation":
         model = ShapeSegNet(num_classes=num_classes, stride=cfg.seg_stride)
+    elif cfg.task == "classification":
+        model = ShapeClassifier(num_classes=num_classes, encoder_type=encoder_type)
     else:
         model = CenterPredictor(
             num_classes=num_classes,
@@ -732,6 +752,12 @@ def main() -> None:
                         masks = masks.to(device, non_blocking=True)
                     out = model(images)
                     loss = seg_loss_fn(out, masks)
+                elif cfg.task == "classification":
+                    classes = torch.tensor(
+                        [a[0]["shape"] for a in anns], dtype=torch.long, device=device,
+                    )
+                    out = model(images)
+                    loss = F.cross_entropy(out, classes)
                 else:
                     centers_list, classes_list, _ = build_targets_multi(anns, device)
                     out = model(images)
@@ -768,6 +794,8 @@ def main() -> None:
                 )
             elif cfg.task == "segmentation":
                 vm = evaluate_seg(model, val_loader, device, num_classes, class_names)
+            elif cfg.task == "classification":
+                vm = evaluate_classification(model, val_loader, device)
             else:
                 vm = evaluate_multi(model, val_loader, device, img_size, class_names)
             logger.log_metrics(vm, step=epoch)
