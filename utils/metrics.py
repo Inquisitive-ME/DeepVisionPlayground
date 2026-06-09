@@ -659,3 +659,56 @@ def evaluate_multi_object(
         n_gt=n_gt_total,
         n_pred=n_pred_total,
     )
+
+
+@dataclass
+class SegmentationMetrics:
+    """Semantic-segmentation metrics. Classes include the background class
+    (index num_classes); per_class_iou is keyed by class index."""
+    miou: float = 0.0
+    pixel_acc: float = 0.0
+    per_class_iou: dict[int, float] = field(default_factory=dict)
+    class_names: tuple[str, ...] = ()
+
+    def _tag(self, c: int) -> str:
+        if self.class_names and 0 <= c < len(self.class_names):
+            return self.class_names[c]
+        return f"class_{c}"
+
+    def to_dict(self) -> dict[str, float]:
+        out: dict[str, float] = {"seg/miou": self.miou, "seg/pixel_acc": self.pixel_acc}
+        for c, v in self.per_class_iou.items():
+            out[f"seg/iou/{self._tag(c)}"] = v
+        return out
+
+
+def segmentation_confusion(
+    pred_labels: torch.Tensor, gt_labels: torch.Tensor, num_classes_incl_bg: int
+) -> torch.Tensor:
+    """(K, K) confusion matrix counts[gt, pred] over all pixels, K classes
+    (including background). Accumulate these across batches, then pass the sum
+    to ``evaluate_segmentation`` — cheaper than collecting every mask."""
+    k = num_classes_incl_bg
+    g = gt_labels.reshape(-1).long()
+    p = pred_labels.reshape(-1).long()
+    conf = torch.bincount(g * k + p, minlength=k * k).reshape(k, k)
+    return conf.cpu()
+
+
+def evaluate_segmentation(
+    confusion: torch.Tensor, class_names: tuple[str, ...] = ()
+) -> SegmentationMetrics:
+    """Per-class IoU, mIoU (over classes that appear), and pixel accuracy from
+    an accumulated confusion matrix."""
+    conf = confusion.double()
+    tp = conf.diag()
+    union = conf.sum(dim=1) + conf.sum(dim=0) - tp
+    iou = torch.where(union > 0, tp / union.clamp_min(1.0), torch.zeros_like(tp))
+    present = union > 0
+    miou = float(iou[present].mean()) if bool(present.any()) else 0.0
+    pixel_acc = float(tp.sum() / conf.sum().clamp_min(1.0))
+    per_class = {int(c): float(iou[c]) for c in range(conf.shape[0])}
+    return SegmentationMetrics(
+        miou=miou, pixel_acc=pixel_acc, per_class_iou=per_class,
+        class_names=tuple(class_names),
+    )
