@@ -12,8 +12,8 @@ python -m scripts.run_training --config configs/train_clean_eval_rotated.yaml
 
 When `--config` is given it is authoritative (the other CLI flags are
 ignored). Any field you omit falls back to the per-task default, so configs
-stay short. `task:` can be any of the six (`single`, `multi`, `heatmap`,
-`multi_heatmap`, `segmentation`, `classification`).
+stay short. `task:` can be any of the seven (`single`, `multi`, `heatmap`,
+`multi_heatmap`, `segmentation`, `instance_seg`, `classification`).
 
 ## Examples here
 
@@ -22,6 +22,7 @@ stay short. `task:` can be any of the six (`single`, `multi`, `heatmap`,
 - `segment_zero_shot.yaml` — semantic segmentation trained on rectangles +
   circles only, then evaluated on a set that also contains triangles (does it
   segment a shape class it never saw? watch `seg/iou/TRIANGLE`).
+- `instance_seg.yaml` — instance segmentation (separates individual shapes).
 
 Every `DatasetConfig` knob is settable per distribution:
 

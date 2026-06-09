@@ -68,6 +68,9 @@ pretty-prints the bucket sweeps as a Markdown table.
     multi_heatmap  CenterNet heatmap with NMS for N shapes (sub-pixel + multi)
     segmentation   per-pixel class (ShapeSegNet); reports mIoU / pixel-acc.
                    --seg-stride 1 = full-resolution masks.
+    instance_seg   per-shape instances (InstanceSegNet): semantic + center
+                   heatmap, pixels grouped to nearest center. Reports matched
+                   IoU / recall@IoU. --max-objects caps decoded instances.
     classification single-shape class, no localization (ShapeClassifier);
                    reports accuracy. Pair with a --encoder *_gap variant.
 
