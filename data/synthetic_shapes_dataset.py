@@ -158,21 +158,26 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                  transform: Optional[Callable[[Any], Any]] = None,
                  save_location: str = "shape_dataset",
                  seed: Optional[int] = None,
-                 with_masks: bool = False,):
+                 with_masks: bool = False,
+                 with_instances: bool = False,):
         validate_shape_size_range(image_size, shape_size_range)
-        if with_masks and shape_outline != ShapeOutline.FILL:
+        need_label = with_masks or with_instances
+        if need_label and shape_outline != ShapeOutline.FILL:
             # Outline-only shapes leave their interior background-colored, so a
-            # filled mask wouldn't match the image. v1 segmentation masks
-            # therefore require filled shapes (also the GPU path's only mode).
+            # filled mask wouldn't match the image. v1 masks require filled
+            # shapes (also the GPU path's only mode).
             raise NotImplementedError(
-                "with_masks currently requires shape_outline=FILL "
+                "with_masks/with_instances currently require shape_outline=FILL "
                 f"(got {shape_outline}); outlined-shape masks aren't supported yet."
             )
-        if with_masks and fixed_dataset:
+        if need_label and fixed_dataset:
             # The fixed-dataset cache only stores (img, annotations); masks
             # aren't persisted, so a cached item would return a None mask.
-            raise NotImplementedError("with_masks is not supported with fixed_dataset=True")
+            raise NotImplementedError(
+                "with_masks/with_instances are not supported with fixed_dataset=True"
+            )
         self.with_masks = with_masks
+        self.with_instances = with_instances
         self.num_images = num_images
         self.image_size = image_size
         self.num_shapes_range = num_shapes_range
@@ -251,7 +256,7 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
             img, ann, mask = self.generate_image()
         if self.transform:
             img = self.transform(img)
-        if self.with_masks:
+        if self.with_masks or self.with_instances:
             return img, ann, mask
         return img, ann
 
@@ -484,14 +489,17 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
             img = add_gaussian_noise(img, np_rng=np_rng)
 
         label = None
-        if self.with_masks:
-            # Render the recorded shapes (filled with their class) onto a label
-            # canvas in the same draw order, so the mask matches the image
-            # pixel-for-pixel including overlaps. Background = len(ShapeType).
-            label_img = Image.new("L", self.image_size, len(ShapeType))
+        if self.with_masks or self.with_instances:
+            # Render the recorded shapes onto a label canvas in the same draw
+            # order, so the mask matches the image pixel-for-pixel including
+            # overlaps. Semantic: fill with the class, background=len(ShapeType).
+            # Instance: fill with the 1-based shape index, background=0.
+            bg = 0 if self.with_instances else len(ShapeType)
+            label_img = Image.new("L", self.image_size, bg)
             label_draw = ImageDraw.Draw(label_img)
-            for kind, coords, cls in mask_specs:
-                getattr(label_draw, kind)(coords, fill=cls)
+            for inst_idx, (kind, coords, cls) in enumerate(mask_specs):
+                fill = (inst_idx + 1) if self.with_instances else cls
+                getattr(label_draw, kind)(coords, fill=fill)
             label = torch.from_numpy(np.array(label_img, dtype=np.int64))  # (H, W)
 
         return img, annotations, label

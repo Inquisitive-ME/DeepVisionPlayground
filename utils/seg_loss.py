@@ -8,9 +8,13 @@ for the imbalanced-foreground regime.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils.heatmap_loss import focal_heatmap_loss, multi_gaussian_target
 
 
 class SegLoss(nn.Module):
@@ -35,3 +39,36 @@ class SegLoss(nn.Module):
             dice = 1.0 - ((2 * inter + 1.0) / (union + 1.0)).mean()
             loss = loss + self.lambda_dice * dice
         return loss
+
+
+@dataclass
+class InstanceSegLossTerms:
+    total: torch.Tensor
+    semantic: torch.Tensor
+    heatmap: torch.Tensor
+
+
+class InstanceSegLoss(nn.Module):
+    """Semantic cross-entropy + a CenterNet focal loss on the center heatmap.
+
+    Grouping (assigning pixels to centers) happens at decode time and needs no
+    loss term; supervising "good semantics + well-localized centers" is enough
+    to separate instances.
+    """
+
+    def __init__(self, sigma: float = 2.0, lambda_heatmap: float = 1.0) -> None:
+        super().__init__()
+        self.seg = SegLoss()
+        self.sigma = sigma
+        self.lambda_heatmap = lambda_heatmap
+
+    def forward(self, out, class_map: torch.Tensor,
+                centers_px_per_image: list[torch.Tensor]) -> InstanceSegLossTerms:
+        """``out`` is an InstanceSegOutput; ``class_map`` is (B, H, W) long;
+        ``centers_px_per_image`` is a per-image list of (N_b, 2) GT centers in
+        image-pixel coords."""
+        seg = self.seg(out.semantic_logits, class_map)
+        _, _, hh, ww = out.heatmap.shape
+        target_hm = multi_gaussian_target(centers_px_per_image, hh, ww, out.stride, self.sigma)
+        hm = focal_heatmap_loss(out.heatmap, target_hm)
+        return InstanceSegLossTerms(total=seg + self.lambda_heatmap * hm, semantic=seg, heatmap=hm)

@@ -32,6 +32,7 @@ from data.dataset_config import DatasetConfig, build_cpu_dataset, build_gpu_load
 from data.synthetic_shapes_dataset import ShapeDataset, seed_worker
 from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
+from models.instance_seg_net import InstanceSegNet
 from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
 from models.seg_net import ShapeSegNet
@@ -41,13 +42,14 @@ from models.types import ModelType
 from utils.heatmap_loss import HeatmapLoss, MultiHeatmapLoss
 from utils.losses import CenterPredictionLoss
 from utils.metrics import (
+    evaluate_instance_segmentation,
     evaluate_multi_object,
     evaluate_segmentation,
     evaluate_single_object,
     segmentation_confusion,
 )
 from utils.perf import configure_for_speed, pick_device
-from utils.seg_loss import SegLoss
+from utils.seg_loss import InstanceSegLoss, SegLoss
 from utils.training_logger import TrainingLogger
 
 
@@ -106,7 +108,8 @@ def parse_args() -> RunConfig:
     )
     p.add_argument(
         "--task",
-        choices=("single", "multi", "heatmap", "multi_heatmap", "segmentation", "classification"),
+        choices=("single", "multi", "heatmap", "multi_heatmap", "segmentation",
+                 "classification", "instance_seg"),
         default="single",
     )
     p.add_argument(
@@ -588,6 +591,26 @@ def evaluate_classification(model, loader, device):
     return {"classification/accuracy": correct / total if total else 0.0}
 
 
+def evaluate_instance_seg(model, loader, device, max_objects):
+    """Decode instances (semantic + nearest-center grouping), upsample to GT
+    resolution, and match to the GT instance maps (matched IoU / recall@IoU)."""
+    model.eval()
+    pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for batch in loader:
+            images, inst_gt = batch[0], batch[2]  # inst_gt: (B, H, W) instance ids
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
+            _, pred_inst = model.decode(model(images), max_objects=max_objects)
+            if pred_inst.shape[-2:] != inst_gt.shape[-2:]:
+                pred_inst = F.interpolate(
+                    pred_inst.unsqueeze(1).float(), size=inst_gt.shape[-2:], mode="nearest",
+                ).squeeze(1).long()
+            for b in range(pred_inst.shape[0]):
+                pairs.append((pred_inst[b].cpu(), inst_gt[b].cpu()))
+    return evaluate_instance_segmentation(pairs).to_dict()
+
+
 def main() -> None:
     cfg = parse_args()
     check_single_shape_tasks(cfg)
@@ -608,8 +631,10 @@ def main() -> None:
     # train-on-rect+circle / test-on-triangle keeps consistent indices).
     num_classes = len(ShapeType)
     class_names = tuple(s.name for s in ShapeType)
-    # Segmentation needs per-pixel label maps from the loaders.
+    # Segmentation needs a per-pixel class map; instance seg needs a per-pixel
+    # instance-id map. Both arrive as the loader's 3rd batch element.
     need_masks = cfg.task == "segmentation"
+    need_instances = cfg.task == "instance_seg"
 
     if cfg.gpu_data:
         if device.type != "cuda":
@@ -618,24 +643,26 @@ def main() -> None:
             train_dc, batch_size=cfg.batch_size, num_images=cfg.num_train_images,
             image_size=img_size, seed=train_seed, device=device,
             reseed_each_epoch=False,  # train draws fresh data every epoch
-            with_masks=need_masks,
+            with_masks=need_masks, with_instances=need_instances,
         )
         # Val must be a FIXED dataset across epochs (reseed_each_epoch=True), or
         # the val metric is computed on different data every epoch.
         val_loader: Any = build_gpu_loader(
             val_dc, batch_size=cfg.batch_size, num_images=cfg.num_val_images,
             image_size=img_size, seed=cfg.val_seed, device=device,
-            reseed_each_epoch=True, with_masks=need_masks,
+            reseed_each_epoch=True, with_masks=need_masks, with_instances=need_instances,
         )
     else:
         pin_memory = device.type == "cuda"
         train_dataset = build_cpu_dataset(
             train_dc, num_images=cfg.num_train_images, image_size=img_size,
-            seed=train_seed, transform=transform, with_masks=need_masks,
+            seed=train_seed, transform=transform,
+            with_masks=need_masks, with_instances=need_instances,
         )
         val_dataset = build_cpu_dataset(
             val_dc, num_images=cfg.num_val_images, image_size=img_size,
-            seed=cfg.val_seed, transform=transform, with_masks=need_masks,
+            seed=cfg.val_seed, transform=transform,
+            with_masks=need_masks, with_instances=need_instances,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.batch_size, shuffle=True,
@@ -662,6 +689,8 @@ def main() -> None:
         model = ShapeSegNet(num_classes=num_classes, stride=cfg.seg_stride)
     elif cfg.task == "classification":
         model = ShapeClassifier(num_classes=num_classes, encoder_type=encoder_type)
+    elif cfg.task == "instance_seg":
+        model = InstanceSegNet(num_classes=num_classes, stride=cfg.seg_stride)
     else:
         model = CenterPredictor(
             num_classes=num_classes,
@@ -683,6 +712,7 @@ def main() -> None:
     heatmap_loss_fn = HeatmapLoss(lambda_class=cfg.lambda_class)
     multi_heatmap_loss_fn = MultiHeatmapLoss(lambda_class=cfg.lambda_class)
     seg_loss_fn = SegLoss()
+    instance_seg_loss_fn = InstanceSegLoss()
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     run_name = f"{cfg.task}_{cfg.encoder}_{img_size[0]}_bs{cfg.batch_size}"
@@ -774,6 +804,33 @@ def main() -> None:
                     )
                     out = model(images)
                     loss = F.cross_entropy(out, classes)
+                elif cfg.task == "instance_seg":
+                    assert masks is not None  # (B, H, W) instance-id map
+                    if masks.device != device:
+                        masks = masks.to(device, non_blocking=True)
+                    w, h = img_size
+                    scale = torch.tensor([w, h], dtype=torch.float32, device=device)
+                    # Per-image: class map (instance id -> its class via a LUT)
+                    # and GT centers (one per instance, from the annotations).
+                    class_maps = []
+                    centers_per_image = []
+                    for b, ann in enumerate(anns):
+                        lut = torch.full((len(ann) + 1,), num_classes, dtype=torch.long, device=device)
+                        for i, o in enumerate(ann):
+                            lut[i + 1] = o["shape"]
+                        class_maps.append(lut[masks[b]])
+                        if ann:
+                            centers_per_image.append(
+                                torch.tensor([o["center"] for o in ann],
+                                             dtype=torch.float32, device=device) * scale
+                            )
+                        else:
+                            centers_per_image.append(torch.zeros((0, 2), dtype=torch.float32, device=device))
+                    class_map = torch.stack(class_maps)
+                    out = model(images)
+                    terms = instance_seg_loss_fn(out, class_map, centers_per_image)
+                    loss = terms.total
+                    sums["hm_heatmap"] += float(terms.heatmap.detach()) * images.size(0)
                 else:
                     centers_list, classes_list, _ = build_targets_multi(anns, device)
                     out = model(images)
@@ -812,12 +869,16 @@ def main() -> None:
                 vm = evaluate_seg(model, val_loader, device, num_classes, class_names)
             elif cfg.task == "classification":
                 vm = evaluate_classification(model, val_loader, device)
+            elif cfg.task == "instance_seg":
+                vm = evaluate_instance_seg(model, val_loader, device, cfg.max_objects)
             else:
                 vm = evaluate_multi(model, val_loader, device, img_size, class_names)
             logger.log_metrics(vm, step=epoch)
             final_metrics = vm
 
-            interesting_substrings = ("_px", "accuracy", "map", "pearson", "miou", "pixel_acc")
+            interesting_substrings = (
+                "_px", "accuracy", "map", "pearson", "miou", "pixel_acc", "mean_iou", "recall@0",
+            )
             extras = ", ".join(
                 f"{k.split('/')[-1]}={v:.3f}"
                 for k, v in vm.items()

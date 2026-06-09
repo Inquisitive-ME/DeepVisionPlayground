@@ -295,14 +295,18 @@ def render_batch(
     image_size: tuple[int, int],
     device: torch.device,
     with_masks: bool = False,
+    with_instances: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Rasterize a planned batch on ``device``.
 
     Returns ``(images, labels)`` where images is (B, 3, H, W) float32 in [0, 1].
-    When ``with_masks`` is set, labels is a (B, H, W) long semantic mask
-    (pixel = ShapeType.value, background = len(ShapeType)), composited in the
-    same draw order as the image so it matches pixel-for-pixel (including
-    overlaps); otherwise labels is None.
+    The label map is composited in the same draw order as the image so it
+    matches pixel-for-pixel (including overlaps):
+    - ``with_masks``: (B, H, W) long SEMANTIC mask (pixel = ShapeType.value,
+      background = len(ShapeType)).
+    - ``with_instances``: (B, H, W) long INSTANCE mask (pixel = slot index + 1,
+      background = 0) — each shape gets its own id.
+    Otherwise labels is None. At most one of the two flags should be set.
     """
     plan_d = _ShapeBatchPlan(
         bg_colors=plan.bg_colors.to(device),
@@ -321,11 +325,13 @@ def render_batch(
     B, N_max = plan_d.valid.shape
     # Initialize canvas with solid background colors.
     canvas = plan_d.bg_colors[:, :, None, None].expand(B, 3, h, w).contiguous().float() / 255.0
-    # Semantic label map (background everywhere), filled in the same loop.
-    labels = (
-        torch.full((B, h, w), len(ShapeType), dtype=torch.long, device=device)
-        if with_masks else None
-    )
+    # Label map (background everywhere), filled in the same loop. Semantic uses
+    # the class with background=len(ShapeType); instance uses slot+1 with bg=0.
+    labels = None
+    if with_instances:
+        labels = torch.zeros((B, h, w), dtype=torch.long, device=device)
+    elif with_masks:
+        labels = torch.full((B, h, w), len(ShapeType), dtype=torch.long, device=device)
 
     grid = _pixel_grid(image_size, device)  # (H, W, 2)
 
@@ -375,8 +381,12 @@ def render_batch(
             canvas,
         )
         if labels is not None:
-            cls_n = plan_d.classes[:, n]              # (B,) long
-            labels = torch.where(chosen, cls_n[:, None, None], labels)
+            if with_instances:
+                # slot n -> instance id n+1 (slots fill contiguously in draw order)
+                fill = torch.full((B,), n + 1, dtype=torch.long, device=device)
+            else:
+                fill = plan_d.classes[:, n]           # (B,) long, the class
+            labels = torch.where(chosen, fill[:, None, None], labels)
 
     return canvas, labels
 
@@ -406,6 +416,7 @@ class GpuShapeLoader(Iterable):
         seed: int | None = None,
         reseed_each_epoch: bool = False,
         with_masks: bool = False,
+        with_instances: bool = False,
     ):
         if num_shapes_range[0] < 0 or num_shapes_range[1] < num_shapes_range[0]:
             raise ValueError(f"bad num_shapes_range={num_shapes_range}")
@@ -423,6 +434,7 @@ class GpuShapeLoader(Iterable):
         self.rotate_shapes = rotate_shapes
         self.max_overlap = max_overlap
         self.with_masks = with_masks
+        self.with_instances = with_instances
         self.device = torch.device(device)
         # Keep the seed so a val loader can re-derive the SAME dataset every
         # epoch. Training loaders leave reseed_each_epoch=False so they keep
@@ -457,9 +469,10 @@ class GpuShapeLoader(Iterable):
                 max_overlap=self.max_overlap,
             )
             images, masks = render_batch(
-                plan, self.image_size, self.device, with_masks=self.with_masks,
+                plan, self.image_size, self.device,
+                with_masks=self.with_masks, with_instances=self.with_instances,
             )
-            if self.with_masks:
+            if self.with_masks or self.with_instances:
                 yield images, plan.annotations, masks
             else:
                 yield images, plan.annotations
