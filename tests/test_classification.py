@@ -1,16 +1,44 @@
 """Tests for the whole-image shape-classification task."""
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from data.annotations import ShapeOutline, ShapeType
+from data.dataset_config import DatasetConfig
 from data.synthetic_shapes_dataset import ShapeDataset
 from models.encoders import EncodeType
 from models.shape_classifier import ShapeClassifier
-from scripts.run_training import evaluate_classification
+from scripts.run_training import RunConfig, check_single_shape_tasks, evaluate_classification
+
+
+def test_single_shape_task_rejects_empty_images():
+    """A single-object task whose distribution can yield a 0-shape image must
+    error clearly up front, not IndexError deep in training."""
+    cfg = RunConfig(
+        task="classification",
+        train=DatasetConfig(num_shapes_range=(0, 3)),
+        val=DatasetConfig(num_shapes_range=(0, 3)),
+    )
+    with pytest.raises(ValueError):
+        check_single_shape_tasks(cfg)
+
+
+def test_single_shape_task_ok_and_multi_unaffected():
+    check_single_shape_tasks(RunConfig(
+        task="classification",
+        train=DatasetConfig(num_shapes_range=(1, 1)),
+        val=DatasetConfig(num_shapes_range=(1, 1)),
+    ))
+    # Multi-object tasks legitimately allow empty images.
+    check_single_shape_tasks(RunConfig(
+        task="multi",
+        train=DatasetConfig(num_shapes_range=(0, 3)),
+        val=DatasetConfig(num_shapes_range=(0, 3)),
+    ))
 
 
 def test_classifier_output_shape():

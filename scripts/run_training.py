@@ -254,6 +254,21 @@ def parse_args() -> RunConfig:
     )
 
 
+def check_single_shape_tasks(cfg: RunConfig) -> None:
+    """single / heatmap / classification look at exactly one annotation per
+    image (``a[0]``), so a distribution that can yield an empty image would
+    crash deep in training with an opaque IndexError. Reject it up front with a
+    clear message instead."""
+    if cfg.task in ("single", "heatmap", "classification"):
+        for name, dc in (("train", cfg.train), ("val", cfg.val)):
+            if dc.num_shapes_range[0] < 1:
+                raise ValueError(
+                    f"--task {cfg.task} uses one shape per image; "
+                    f"{name}.num_shapes_range={dc.num_shapes_range} can produce empty "
+                    f"images. Set num_shapes_range to [1, 1]."
+                )
+
+
 def load_run_config(path: str) -> RunConfig:
     """Load a YAML study config into a RunConfig.
 
@@ -575,6 +590,7 @@ def evaluate_classification(model, loader, device):
 
 def main() -> None:
     cfg = parse_args()
+    check_single_shape_tasks(cfg)
     configure_for_speed()
     device = pick_device()
     print(f"device={device}, config={cfg}")

@@ -210,7 +210,13 @@ def _sweep(model: torch.nn.Module, defaults: _ValDefaults, device: torch.device,
         # Override just the swept field(s) of the baseline distribution.
         from dataclasses import replace
         d = replace(defaults, dataset=defaults.dataset.merged(overrides))
-        loader = _build_loader(d, device)
+        try:
+            loader = _build_loader(d, device)
+        except NotImplementedError as e:
+            # e.g. a segmentation model (needs masks) swept over outlines, which
+            # the mask path doesn't support yet. Skip the point, don't abort.
+            print(f"  {label:>20s}: skipped ({e})")
+            continue
         vm = _evaluate(model, loader, d, device)
         # Pick the right metric subset for the task.
         if defaults.task == "segmentation":

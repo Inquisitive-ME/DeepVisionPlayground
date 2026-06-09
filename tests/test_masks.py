@@ -86,6 +86,16 @@ def test_with_masks_requires_filled_shapes():
         )
 
 
+def test_with_masks_rejects_fixed_dataset():
+    # The fixed-dataset cache doesn't persist masks, so the combination would
+    # return a None mask and crash collate; reject it up front.
+    with pytest.raises(NotImplementedError):
+        ShapeDataset(
+            image_size=(64, 64), shape_outline=ShapeOutline.FILL,
+            with_masks=True, fixed_dataset=True,
+        )
+
+
 def test_cpu_default_no_masks_keeps_two_tuple():
     ds = ShapeDataset(
         num_images=2, seed=0, image_size=(32, 32),

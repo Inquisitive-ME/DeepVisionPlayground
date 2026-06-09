@@ -168,6 +168,10 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 "with_masks currently requires shape_outline=FILL "
                 f"(got {shape_outline}); outlined-shape masks aren't supported yet."
             )
+        if with_masks and fixed_dataset:
+            # The fixed-dataset cache only stores (img, annotations); masks
+            # aren't persisted, so a cached item would return a None mask.
+            raise NotImplementedError("with_masks is not supported with fixed_dataset=True")
         self.with_masks = with_masks
         self.num_images = num_images
         self.image_size = image_size
