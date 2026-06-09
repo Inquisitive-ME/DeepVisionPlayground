@@ -4,9 +4,15 @@ from __future__ import annotations
 import pytest
 import torch
 
+from models.instance_seg_net import InstanceSegNet
 from models.seg_net import ShapeSegNet
 from utils.metrics import evaluate_segmentation, segmentation_confusion
 from utils.seg_loss import SegLoss
+
+
+def test_instance_seg_is_a_stub():
+    with pytest.raises(NotImplementedError):
+        InstanceSegNet()
 
 
 class TestShapeSegNet:
