@@ -61,11 +61,15 @@ pretty-prints the bucket sweeps as a Markdown table.
     (train on one distribution, validate on another); val inherits train and
     overrides only what shifts, so there are no per-augmentation flags.
 
---task {single, multi, heatmap, multi_heatmap}
+--task {single, multi, heatmap, multi_heatmap, segmentation, classification}
     single         FC regression on one shape
     multi          FC + slot-based detection on N shapes (Hungarian-matched)
     heatmap        CenterNet heatmap on one shape (sub-pixel)
     multi_heatmap  CenterNet heatmap with NMS for N shapes (sub-pixel + multi)
+    segmentation   per-pixel class (ShapeSegNet); reports mIoU / pixel-acc.
+                   --seg-stride 1 = full-resolution masks.
+    classification single-shape class, no localization (ShapeClassifier);
+                   reports accuracy. Pair with a --encoder *_gap variant.
 
 --encoder {simple, simple_bn, simple_gn, simple_gap, simple_bn_gap,
            simple_gn_gap, resnet18, resnet18_spatial, resnet34, resnet34_spatial}
