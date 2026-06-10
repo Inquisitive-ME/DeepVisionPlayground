@@ -16,12 +16,14 @@ This repo gives you:
   rotation, color, background, and overlap. Generates fresh data per epoch
   on the GPU so you never overfit and never wait on the dataloader — and emits
   pixel-perfect segmentation masks for free (the generator is the labeller).
-- **Six tasks** behind one `--task` switch: center detection (`single`,
-  `multi`, `heatmap`, `multi_heatmap`), semantic `segmentation`, and whole-image
-  `classification` — covering localize / classify / segment from the vision.
+- **Seven tasks** behind one `--task` switch: center detection (`single`,
+  `multi`, `heatmap`, `multi_heatmap`), semantic `segmentation`,
+  `instance_seg`, and whole-image `classification` — covering localize /
+  classify / segment from the vision.
 - **Real metrics** per task: detection P/R + `map_center` AP (with per-class,
   per-size, per-density breakdowns and Pearson), segmentation mIoU / per-class
-  IoU / pixel accuracy, and classification accuracy.
+  IoU / pixel accuracy, instance matched-IoU / recall@IoU, and classification
+  accuracy.
 - **Post-training sweeps**: take one trained model, eval it against a grid
   of (shape count, shape size) val sets, and read the failure landscape.
 - **Real benchmarking infrastructure**: a CLI driver, a pytest harness, a
@@ -137,9 +139,10 @@ Backgrounds are random solid colors.
 | `multi_heatmap` | `MultiHeatmapNet` | Same as heatmap but with top-K NMS decode for multi-object. | `map_center` AP, matched px |
 | `segmentation` | `ShapeSegNet` | Per-pixel class (background + each shape type). Encoder-decoder, argmax decode. | mIoU, per-class IoU, pixel acc |
 | `classification` | `ShapeClassifier` | The class of the single shape (no localization). Encoder + linear head. | accuracy |
+| `instance_seg` | `InstanceSegNet` | Per-pixel class + a center heatmap; foreground pixels grouped to the nearest detected center → per-shape instances. | matched IoU, recall@IoU |
 
 For heatmaps: `--heatmap-stride 4` is fastest, `1` is exact-pixel. For
-segmentation: `--seg-stride 1` is full-resolution masks (target mIoU→1.0).
+segmentation/instance_seg: `--seg-stride 1` is full-resolution (target mIoU→1.0).
 
 ```bash
 # Semantic segmentation (free pixel-perfect masks; ~400 K params):
@@ -147,13 +150,15 @@ python -m scripts.run_training --task segmentation --gpu-data \
     --epochs 500 --batch-size 100 --image-size 256 \
     --num-shapes-min 1 --num-shapes-max 5 --seg-stride 1 --lr 1e-3
 
+# Instance segmentation (separates individual shapes via center grouping):
+python -m scripts.run_training --task instance_seg --gpu-data \
+    --epochs 500 --batch-size 64 --image-size 128 \
+    --num-shapes-min 1 --num-shapes-max 5 --max-objects 8 --seg-stride 2 --lr 2e-3
+
 # Whole-image shape classification (GAP encoder is ideal here):
 python -m scripts.run_training --task classification --gpu-data \
     --encoder simple_gn_gap --epochs 200 --image-size 128
 ```
-
-Instance segmentation is scoped (per-shape masks) but not yet built —
-see `docs/instance_segmentation_design.md`.
 
 ## Encoders
 
@@ -202,6 +207,10 @@ Segmentation (`--task segmentation`) instead reports:
 - **`seg/pixel_acc`**: fraction of correctly-classified pixels.
 
 Classification (`--task classification`) reports **`classification/accuracy`**.
+
+Instance segmentation (`--task instance_seg`) reports **`instance/mean_iou`**
+(matched-IoU averaged over GT instances) and **`instance/recall@{0.5,0.75}`**
+(fraction of GT instances matched at that IoU).
 
 ## Layout
 

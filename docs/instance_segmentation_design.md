@@ -1,10 +1,20 @@
-# Instance segmentation — design (scoped, not yet implemented)
+# Instance segmentation — design + v1 status
 
 Semantic segmentation (`--task segmentation`) labels each pixel with a *class*.
 Instance segmentation additionally separates *individual shapes* — two
-overlapping rectangles are one semantic region but two instances. This is the
-natural next step; the pieces are mostly already here. `InstanceSegNet`
-(`models/instance_seg_net.py`) is a stub that points back to this doc.
+overlapping rectangles are one semantic region but two instances.
+
+**Implemented (v1):** `--task instance_seg` (`models/instance_seg_net.py`
+`InstanceSegNet`). It takes **option 1 below**: a shared encoder-decoder with a
+semantic head and a CenterNet center-heatmap head; at decode time each
+foreground pixel is grouped to its nearest detected center. GT is the free
+instance-id map (below); the loss is semantic CE + focal heatmap
+(`InstanceSegLoss`); the metric is greedy IoU matching of predicted to GT
+instances — `instance/mean_iou` and `instance/recall@{0.5,0.75}`
+(`evaluate_instance_segmentation`). The per-pixel **offset-to-center head**
+(full Panoptic-DeepLab, option 1's refinement) is the main remaining
+improvement for heavily-overlapping shapes; mask-AP / Panoptic-Quality metrics
+are a further follow-up.
 
 ## Ground truth is (still) free
 

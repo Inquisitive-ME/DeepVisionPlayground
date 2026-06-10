@@ -1,0 +1,23 @@
+# Instance segmentation: separate individual shapes, not just their classes.
+# InstanceSegNet predicts a semantic map + a center heatmap; at decode time each
+# foreground pixel is grouped to its nearest detected center, so two shapes of
+# the same class become two instances. Reports instance/mean_iou and
+# instance/recall@{0.5,0.75}.
+#
+#   python -m scripts.run_training --config configs/instance_seg.yaml
+
+task: instance_seg
+gpu_data: true
+epochs: 500
+batch_size: 64
+image_size: 128
+seg_stride: 2
+lr: 2.0e-3
+max_objects: 8        # caps decoded instances; set >= num_shapes_range max
+num_train_images: 1000
+num_val_images: 300
+
+train:
+  num_shapes_range: [1, 5]
+val:
+  num_shapes_range: [1, 5]

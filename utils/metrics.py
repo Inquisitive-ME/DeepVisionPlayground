@@ -712,3 +712,65 @@ def evaluate_segmentation(
         miou=miou, pixel_acc=pixel_acc, per_class_iou=per_class,
         class_names=tuple(class_names),
     )
+
+
+@dataclass
+class InstanceSegMetrics:
+    """Instance-segmentation metrics from greedy IoU matching of predicted to
+    GT instance masks."""
+    mean_iou: float = 0.0          # matched IoU summed over GT instances / n_gt
+    recall_at: dict[float, float] = field(default_factory=dict)  # frac of GT matched at IoU>=t
+    n_gt: int = 0
+    n_pred: int = 0
+
+    def to_dict(self) -> dict[str, float]:
+        out: dict[str, float] = {"instance/mean_iou": self.mean_iou}
+        for t, r in self.recall_at.items():
+            out[f"instance/recall@{t}"] = r
+        return out
+
+
+def _instance_match(pred_inst: torch.Tensor, gt_inst: torch.Tensor,
+                    thresholds: tuple[float, ...]) -> tuple[float, int, int, dict[float, int]]:
+    """Hungarian-match predicted to GT instance masks by IoU for one image.
+    Returns (sum of matched IoUs, n_gt, n_pred, {t: #matched with IoU>=t})."""
+    pred_ids = [i for i in pred_inst.unique().tolist() if i != 0]
+    gt_ids = [i for i in gt_inst.unique().tolist() if i != 0]
+    n_pred, n_gt = len(pred_ids), len(gt_ids)
+    tp = {t: 0 for t in thresholds}
+    if n_pred == 0 or n_gt == 0:
+        return 0.0, n_gt, n_pred, tp
+    pm = torch.stack([(pred_inst == i).reshape(-1) for i in pred_ids]).float()  # (P, HW)
+    gm = torch.stack([(gt_inst == i).reshape(-1) for i in gt_ids]).float()      # (G, HW)
+    inter = pm @ gm.t()                                  # (P, G)
+    union = pm.sum(1, keepdim=True) + gm.sum(1, keepdim=True).t() - inter
+    iou = inter / union.clamp_min(1.0)
+    r, c = linear_sum_assignment((-iou).cpu().numpy())
+    matched = iou[r, c]
+    for t in thresholds:
+        tp[t] = int((matched >= t).sum())
+    return float(matched.sum()), n_gt, n_pred, tp
+
+
+def evaluate_instance_segmentation(
+    pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    iou_thresholds: tuple[float, ...] = (0.5, 0.75),
+) -> InstanceSegMetrics:
+    """Aggregate instance metrics over a list of (pred_inst, gt_inst) maps
+    (each (H, W) long, 0 = background)."""
+    iou_sum = 0.0
+    n_gt_total = 0
+    n_pred_total = 0
+    tp_total = {t: 0 for t in iou_thresholds}
+    for pred_inst, gt_inst in pairs:
+        s, n_gt, n_pred, tp = _instance_match(pred_inst, gt_inst, iou_thresholds)
+        iou_sum += s
+        n_gt_total += n_gt
+        n_pred_total += n_pred
+        for t in iou_thresholds:
+            tp_total[t] += tp[t]
+    mean_iou = iou_sum / n_gt_total if n_gt_total else 0.0
+    recall_at = {t: (tp_total[t] / n_gt_total if n_gt_total else 0.0) for t in iou_thresholds}
+    return InstanceSegMetrics(
+        mean_iou=mean_iou, recall_at=recall_at, n_gt=n_gt_total, n_pred=n_pred_total,
+    )
