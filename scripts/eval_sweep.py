@@ -15,6 +15,7 @@ Available sweep dimensions:
   --backgrounds "solid,texture"     BackgroundType
   --noise    "false,true"           add_noise
   --outlines "fill,thin,thick,random"  ShapeOutline
+  --blur     "0,1,2"                Gaussian blur radius in px
   --color-thresholds "20,50,80"     min RGB distance from background
 
 You can specify multiple sweep dimensions in one call; they are run
@@ -247,6 +248,7 @@ def main() -> int:
     p.add_argument("--backgrounds", type=str, default="")
     p.add_argument("--noise", type=str, default="")
     p.add_argument("--outlines", type=str, default="")
+    p.add_argument("--blur", type=str, default="")
     p.add_argument("--color-thresholds", type=str, default="")
     args = p.parse_args()
 
@@ -319,11 +321,19 @@ def main() -> int:
             outline_perts.append((v, {"shape_outline": v}))
         sweeps["outlines"] = _sweep(model, defaults, device, "shape_outline", outline_perts)
 
+    if args.blur:
+        blur_perts: list[Pert] = [
+            (f"blur={b}", {"blur": float(b)}) for b in args.blur.split(",") if b
+        ]
+        sweeps["blur"] = _sweep(model, defaults, device, "blur radius", blur_perts)
+
     if args.color_thresholds:
-        # color threshold isn't a ShapeDataset constructor arg — it's
-        # baked into select_shape_color. Plumbing it through would be a
-        # separate change; for now we just refuse with a clear message.
-        print("(color-thresholds sweep not yet wired through ShapeDataset; skipped)")
+        ct_perts: list[Pert] = [
+            (f"ct={c}", {"color_threshold": float(c)})
+            for c in args.color_thresholds.split(",") if c
+        ]
+        sweeps["color_thresholds"] = _sweep(
+            model, defaults, device, "color threshold", ct_perts)
 
     if not sweeps:
         print("no sweeps requested. pass at least one of --counts/--sizes/--overlaps/--rotate/"

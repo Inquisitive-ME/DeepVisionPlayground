@@ -155,6 +155,7 @@ def plan_batch(
     rotate_shapes: bool,
     rng: random.Random,
     max_overlap: float = 0.6,
+    color_threshold: float = 50.0,
 ) -> _ShapeBatchPlan:
     """Sample annotations on CPU and pack into fixed-size tensors.
 
@@ -194,7 +195,7 @@ def plan_batch(
         slot = 0
         for _ in range(n):
             shape = rng.choice(shape_types)
-            color = _sample_color_avoiding(rng, bg)
+            color = _sample_color_avoiding(rng, bg, color_threshold)
             min_size, max_size = shape_size_range
             sw = rng.randint(min_size, min(max_size, w // 2))
             sh = rng.randint(min_size, min(max_size, h // 2))
@@ -412,6 +413,7 @@ class GpuShapeLoader(Iterable):
         shape_types: tuple[ShapeType, ...] = tuple(ShapeType),
         rotate_shapes: bool = False,
         max_overlap: float = 0.6,
+        color_threshold: float = 50.0,
         device: torch.device | str = "cuda",
         seed: int | None = None,
         reseed_each_epoch: bool = False,
@@ -433,6 +435,7 @@ class GpuShapeLoader(Iterable):
         self.shape_types = shape_types
         self.rotate_shapes = rotate_shapes
         self.max_overlap = max_overlap
+        self.color_threshold = color_threshold
         self.with_masks = with_masks
         self.with_instances = with_instances
         self.device = torch.device(device)
@@ -467,6 +470,7 @@ class GpuShapeLoader(Iterable):
                 rotate_shapes=self.rotate_shapes,
                 rng=self._rng,
                 max_overlap=self.max_overlap,
+                color_threshold=self.color_threshold,
             )
             images, masks = render_batch(
                 plan, self.image_size, self.device,

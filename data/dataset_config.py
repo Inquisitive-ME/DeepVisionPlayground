@@ -68,6 +68,8 @@ class DatasetConfig:
     background: str = "solid"      # solid | texture | random
     shape_outline: str = "fill"    # fill | thin | thick | random
     add_noise: bool = False
+    blur: float = 0.0              # Gaussian blur radius in px (0 = off; CPU only)
+    color_threshold: float = 50.0  # min RGB distance of a shape's color from the background
     max_overlap: float = 0.6
 
     @classmethod
@@ -132,6 +134,8 @@ def build_cpu_dataset(
         rotate_shapes=cfg.rotate_shapes,
         max_overlap=cfg.max_overlap,
         add_noise=cfg.add_noise,
+        blur=cfg.blur,
+        color_threshold=cfg.color_threshold,
         transform=transform,
         with_masks=with_masks,
         with_instances=with_instances,
@@ -171,6 +175,10 @@ def build_gpu_loader(
         raise NotImplementedError(
             "gpu_data does not support add_noise; use the CPU path for noise studies."
         )
+    if cfg.blur > 0:
+        raise NotImplementedError(
+            "gpu_data does not support blur; use the CPU path for blur studies."
+        )
     return GpuShapeLoader(
         batch_size=batch_size,
         num_images=num_images,
@@ -181,6 +189,7 @@ def build_gpu_loader(
         shape_types=cfg.shape_type_enums(),
         rotate_shapes=cfg.rotate_shapes,
         max_overlap=cfg.max_overlap,
+        color_threshold=cfg.color_threshold,
         device=device,
         reseed_each_epoch=reseed_each_epoch,
         with_masks=with_masks,

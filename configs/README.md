@@ -35,7 +35,11 @@ Every `DatasetConfig` knob is settable per distribution:
 | `background` | `solid` / `texture` / `random` | background type (non-solid is CPU-only) |
 | `shape_outline` | `fill` / `thin` / `thick` / `random` | filled vs outlined (non-fill is CPU-only) |
 | `add_noise` | `true` / `false` | additive Gaussian noise (CPU-only) |
+| `blur` | `0.0`+ | Gaussian blur radius in px (0 = off; CPU-only) |
+| `color_threshold` | `0`–`441` | min RGB distance of a shape's colour from the background |
 | `max_overlap` | `0.0`–`1.0` | max allowed inter-shape overlap |
 
-`texture` / non-`fill` outlines / `add_noise` require the CPU path
+`texture` / non-`fill` outlines / `add_noise` / `blur` require the CPU path
 (`gpu_data: false`); the GPU rasterizer supports solid + filled only.
+`color_threshold` works on both paths. Segmentation masks support outlined
+shapes (CPU); the mask draws the same outline so it matches the image.
