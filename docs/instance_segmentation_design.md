@@ -4,17 +4,21 @@ Semantic segmentation (`--task segmentation`) labels each pixel with a *class*.
 Instance segmentation additionally separates *individual shapes* — two
 overlapping rectangles are one semantic region but two instances.
 
-**Implemented (v1):** `--task instance_seg` (`models/instance_seg_net.py`
-`InstanceSegNet`). It takes **option 1 below**: a shared encoder-decoder with a
-semantic head and a CenterNet center-heatmap head; at decode time each
-foreground pixel is grouped to its nearest detected center. GT is the free
-instance-id map (below); the loss is semantic CE + focal heatmap
-(`InstanceSegLoss`); the metric is greedy IoU matching of predicted to GT
-instances — `instance/mean_iou` and `instance/recall@{0.5,0.75}`
-(`evaluate_instance_segmentation`). The per-pixel **offset-to-center head**
-(full Panoptic-DeepLab, option 1's refinement) is the main remaining
-improvement for heavily-overlapping shapes; mask-AP / Panoptic-Quality metrics
-are a further follow-up.
+**Implemented:** `--task instance_seg` (`models/instance_seg_net.py`
+`InstanceSegNet`) is the full **option 1 below** — a shared encoder-decoder with
+a semantic head, a CenterNet center-heatmap head, **and a per-pixel
+offset-to-center head**. At decode time each foreground pixel votes a center
+(`pixel + offset`) and is grouped to the nearest *detected* center (heatmap NMS
+top-K), so the model learns the assignment rather than relying on raw geometry
+(better on overlaps). GT is the free instance-id map (below); the loss is
+semantic CE + focal heatmap + offset L1 (`InstanceSegLoss`). The metric
+(`evaluate_instance_segmentation`) reports `instance/mean_iou`,
+`instance/recall@{0.5,0.75}`, score-ranked **mask AP@{0.5,0.75}**, and
+**Panoptic Quality** (`instance/pq`).
+
+**Remaining ideas:** heavier multi-scale decoders for very dense scenes, and
+the DETR-style fixed-slot alternative (option 3) for a direct mask-prediction
+comparison.
 
 ## Ground truth is (still) free
 

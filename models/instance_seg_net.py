@@ -1,17 +1,16 @@
-"""Instance segmentation — semantic + center-heatmap, nearest-center grouping.
+"""Instance segmentation — semantic + center heatmap + offset (Panoptic-DeepLab).
 
-A shared GroupNorm encoder-decoder feeds two heads:
-- a per-pixel **semantic** head ``(num_classes + 1, h, w)`` (background = num_classes), and
-- a single-channel **center heatmap** ``(1, h, w)`` (CenterNet-style).
+A shared GroupNorm encoder-decoder feeds three heads:
+- a per-pixel **semantic** head ``(num_classes + 1, h, w)`` (background = num_classes),
+- a single-channel **center heatmap** ``(1, h, w)`` (CenterNet-style), and
+- a 2-channel **offset** head: each pixel's vector to its instance's center
+  (in output-cell units).
 
-Decode = group each foreground pixel to the nearest detected center (a
-Panoptic-DeepLab-style grouping, minus the offset head). This separates
-individual shapes that share a semantic class. It reuses ``SegLoss``, the
-CenterNet ``focal_heatmap_loss`` + ``multi_gaussian_target``, and the
-max-pool NMS, so it is a small delta over the semantic + detection tasks.
-
-A per-pixel offset-to-center head (full Panoptic-DeepLab) would improve heavily
-overlapping cases; see ``docs/instance_segmentation_design.md``.
+Decode: each foreground pixel votes a center (``pixel + offset``) and is grouped
+to the nearest *detected* center (heatmap NMS top-K). The offset lets the model
+learn the assignment, which fixes the boundary/overlap pixels that a raw
+nearest-center rule mis-assigns. Reuses ``SegLoss``, the CenterNet
+``focal_heatmap_loss`` + ``multi_gaussian_target``, and the max-pool NMS.
 """
 from __future__ import annotations
 
@@ -28,6 +27,7 @@ from models.center_heatmap_net import _gn
 class InstanceSegOutput:
     semantic_logits: torch.Tensor  # (B, num_classes + 1, h, w)
     heatmap: torch.Tensor          # (B, 1, h, w) center heatmap logits
+    offset: torch.Tensor           # (B, 2, h, w) (dx, dy) to the instance center, in cells
     stride: int
 
 
@@ -64,6 +64,7 @@ class InstanceSegNet(nn.Module):
         self.decoder = nn.Sequential(*decoder_layers) if decoder_layers else nn.Identity()
         self.semantic_head = nn.Conv2d(cur_channels, num_classes + 1, 1)
         self.heatmap_head = nn.Conv2d(cur_channels, 1, 1)
+        self.offset_head = nn.Conv2d(cur_channels, 2, 1)
         if self.heatmap_head.bias is not None:
             nn.init.constant_(self.heatmap_head.bias, -2.19)  # ≈ logit(0.1), CenterNet init
         self.num_classes = num_classes
@@ -74,6 +75,7 @@ class InstanceSegNet(nn.Module):
         return InstanceSegOutput(
             semantic_logits=self.semantic_head(feat),
             heatmap=self.heatmap_head(feat),
+            offset=self.offset_head(feat),
             stride=self.stride,
         )
 
@@ -84,11 +86,14 @@ class InstanceSegNet(nn.Module):
         max_objects: int = 20,
         nms_kernel: int = 3,
         score_threshold: float = 0.3,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode to ``(semantic, instances)``, both (B, h, w) long at the output
-        stride. ``semantic`` is the per-pixel class (background = num_classes);
-        ``instances`` labels each foreground pixel with the id (1-based) of its
-        nearest detected center (0 = background)."""
+        use_offset: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        """Decode to ``(semantic, instances, scores)``.
+
+        ``semantic`` and ``instances`` are (B, h, w) long at the output stride
+        (instance ids are 1-based, 0 = background). ``scores`` is a per-image
+        list of (K_b,) center confidences, aligned so instance id ``i`` has
+        score ``scores[b][i-1]`` — used to rank instances for mask AP."""
         B, _, hh, ww = out.semantic_logits.shape
         device = out.semantic_logits.device
         bg = self.num_classes
@@ -96,34 +101,38 @@ class InstanceSegNet(nn.Module):
 
         prob = torch.sigmoid(out.heatmap)             # (B, 1, h, w)
         pooled = F.max_pool2d(prob, nms_kernel, stride=1, padding=nms_kernel // 2)
-        peak = (pooled == prob) & (prob > score_threshold)  # (B, 1, h, w)
+        peak = (pooled == prob) & (prob > score_threshold)
         flat_scores = (prob * peak).view(B, -1)
         top_scores, top_idx = flat_scores.topk(min(max_objects, hh * ww), dim=-1)
-        # cell coords of the kept peaks
         cy = (top_idx // ww).float()
         cx = (top_idx % ww).float()
 
-        # Pixel grid in cell coordinates for nearest-center assignment.
         yy, xx = torch.meshgrid(
             torch.arange(hh, device=device, dtype=torch.float32),
             torch.arange(ww, device=device, dtype=torch.float32),
             indexing="ij",
         )
-        grid = torch.stack([xx, yy], dim=-1).view(-1, 2)  # (h*w, 2)
+        grid = torch.stack([xx, yy], dim=-1).view(-1, 2)  # (h*w, 2) in cell coords
 
         instances = torch.zeros((B, hh, ww), dtype=torch.long, device=device)
+        scores: list[torch.Tensor] = []
         for b in range(B):
             keep = top_scores[b] > score_threshold
-            n_centers = int(keep.sum())
-            if n_centers == 0:
+            if not bool(keep.any()):
+                scores.append(torch.empty(0, device=device))
                 continue
-            centers = torch.stack([cx[b][keep], cy[b][keep]], dim=-1)  # (Ki, 2)
-            fg = (semantic[b] != bg).view(-1)                          # (h*w,)
+            centers = torch.stack([cx[b][keep], cy[b][keep]], dim=-1)  # (Ki, 2) cells
+            scores.append(top_scores[b][keep])
+            fg = (semantic[b] != bg).view(-1)
             if not bool(fg.any()):
                 continue
-            d = torch.cdist(grid[fg], centers)        # (M, Ki)
-            nearest = d.argmin(dim=1) + 1             # 1-based instance ids
+            if use_offset:
+                voted = grid + out.offset[b].permute(1, 2, 0).reshape(-1, 2)  # (h*w, 2)
+                pts = voted[fg]
+            else:
+                pts = grid[fg]
+            nearest = torch.cdist(pts, centers).argmin(dim=1) + 1  # 1-based ids
             inst_flat = torch.zeros(hh * ww, dtype=torch.long, device=device)
             inst_flat[fg] = nearest
             instances[b] = inst_flat.view(hh, ww)
-        return semantic, instances
+        return semantic, instances, scores

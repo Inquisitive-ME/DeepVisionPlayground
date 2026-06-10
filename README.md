@@ -209,8 +209,9 @@ Segmentation (`--task segmentation`) instead reports:
 Classification (`--task classification`) reports **`classification/accuracy`**.
 
 Instance segmentation (`--task instance_seg`) reports **`instance/mean_iou`**
-(matched-IoU averaged over GT instances) and **`instance/recall@{0.5,0.75}`**
-(fraction of GT instances matched at that IoU).
+(matched-IoU averaged over GT instances), **`instance/recall@{0.5,0.75}`**,
+score-ranked **`instance/ap@{0.5,0.75}`** (mask AP), and **`instance/pq`**
+(Panoptic Quality).
 
 ## Layout
 

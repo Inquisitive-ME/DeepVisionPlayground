@@ -716,61 +716,127 @@ def evaluate_segmentation(
 
 @dataclass
 class InstanceSegMetrics:
-    """Instance-segmentation metrics from greedy IoU matching of predicted to
-    GT instance masks."""
-    mean_iou: float = 0.0          # matched IoU summed over GT instances / n_gt
+    """Instance-segmentation metrics from IoU matching of predicted to GT
+    instance masks."""
+    mean_iou: float = 0.0          # Hungarian-matched IoU summed over GT / n_gt
     recall_at: dict[float, float] = field(default_factory=dict)  # frac of GT matched at IoU>=t
+    mask_ap: dict[float, float] = field(default_factory=dict)    # score-ranked AP at IoU>=t
+    pq: float = 0.0               # Panoptic Quality (IoU>0.5 matching)
     n_gt: int = 0
     n_pred: int = 0
 
     def to_dict(self) -> dict[str, float]:
-        out: dict[str, float] = {"instance/mean_iou": self.mean_iou}
+        out: dict[str, float] = {"instance/mean_iou": self.mean_iou, "instance/pq": self.pq}
         for t, r in self.recall_at.items():
             out[f"instance/recall@{t}"] = r
+        for t, a in self.mask_ap.items():
+            out[f"instance/ap@{t}"] = a
         return out
 
 
-def _instance_match(pred_inst: torch.Tensor, gt_inst: torch.Tensor,
-                    thresholds: tuple[float, ...]) -> tuple[float, int, int, dict[float, int]]:
-    """Hungarian-match predicted to GT instance masks by IoU for one image.
-    Returns (sum of matched IoUs, n_gt, n_pred, {t: #matched with IoU>=t})."""
+def _instance_ious(pred_inst: torch.Tensor, gt_inst: torch.Tensor):
+    """(P, G) IoU matrix between predicted and GT instance masks, plus the id
+    lists (0 = background, excluded)."""
     pred_ids = [i for i in pred_inst.unique().tolist() if i != 0]
     gt_ids = [i for i in gt_inst.unique().tolist() if i != 0]
-    n_pred, n_gt = len(pred_ids), len(gt_ids)
-    tp = {t: 0 for t in thresholds}
-    if n_pred == 0 or n_gt == 0:
-        return 0.0, n_gt, n_pred, tp
-    pm = torch.stack([(pred_inst == i).reshape(-1) for i in pred_ids]).float()  # (P, HW)
-    gm = torch.stack([(gt_inst == i).reshape(-1) for i in gt_ids]).float()      # (G, HW)
-    inter = pm @ gm.t()                                  # (P, G)
+    if not pred_ids or not gt_ids:
+        return torch.zeros((len(pred_ids), len(gt_ids))), pred_ids, gt_ids
+    pm = torch.stack([(pred_inst == i).reshape(-1) for i in pred_ids]).float()
+    gm = torch.stack([(gt_inst == i).reshape(-1) for i in gt_ids]).float()
+    inter = pm @ gm.t()
     union = pm.sum(1, keepdim=True) + gm.sum(1, keepdim=True).t() - inter
-    iou = inter / union.clamp_min(1.0)
-    r, c = linear_sum_assignment((-iou).cpu().numpy())
-    matched = iou[r, c]
-    for t in thresholds:
-        tp[t] = int((matched >= t).sum())
-    return float(matched.sum()), n_gt, n_pred, tp
+    return inter / union.clamp_min(1.0), pred_ids, gt_ids
+
+
+def _aligned_scores(scores, pred_ids: list[int], n_pred: int) -> list[float]:
+    """Score per predicted instance id (decode emits scores aligned so id i ->
+    scores[i-1]); falls back to uniform when scores are absent."""
+    if scores is None or (hasattr(scores, "numel") and scores.numel() == 0):
+        return [1.0] * n_pred
+    s = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+    return [s[i - 1] if 0 <= i - 1 < len(s) else 0.0 for i in pred_ids]
+
+
+def _ap_from_entries(entries: list[tuple[float, int]], total_gt: int) -> float:
+    if total_gt == 0 or not entries:
+        return 0.0
+    entries.sort(key=lambda e: (-e[0], e[1]))  # score desc; FP before TP on ties
+    tp = fp = 0
+    rec: list[float] = []
+    prec: list[float] = []
+    for _score, is_tp in entries:
+        tp += is_tp
+        fp += 1 - is_tp
+        rec.append(tp / total_gt)
+        prec.append(tp / (tp + fp))
+    return _voc_ap(np.asarray(rec), np.asarray(prec))
 
 
 def evaluate_instance_segmentation(
-    pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    items: list[tuple[torch.Tensor, ...]],
     iou_thresholds: tuple[float, ...] = (0.5, 0.75),
 ) -> InstanceSegMetrics:
-    """Aggregate instance metrics over a list of (pred_inst, gt_inst) maps
-    (each (H, W) long, 0 = background)."""
+    """Aggregate instance metrics over ``(pred_inst, gt_inst[, scores])`` items
+    (maps are (H, W) long, 0 = background; scores rank instances for mask AP)."""
+    n_gt_total = n_pred_total = 0
     iou_sum = 0.0
-    n_gt_total = 0
-    n_pred_total = 0
-    tp_total = {t: 0 for t in iou_thresholds}
-    for pred_inst, gt_inst in pairs:
-        s, n_gt, n_pred, tp = _instance_match(pred_inst, gt_inst, iou_thresholds)
-        iou_sum += s
-        n_gt_total += n_gt
+    tp_recall = {t: 0 for t in iou_thresholds}
+    ap_entries: dict[float, list[tuple[float, int]]] = {t: [] for t in iou_thresholds}
+    pq_iou_sum = 0.0
+    pq_tp = pq_fp = pq_fn = 0
+
+    for item in items:
+        pred_inst, gt_inst = item[0], item[1]
+        scores = item[2] if len(item) > 2 else None
+        iou, pred_ids, gt_ids = _instance_ious(pred_inst, gt_inst)
+        n_pred, n_gt = len(pred_ids), len(gt_ids)
         n_pred_total += n_pred
+        n_gt_total += n_gt
+        pred_scores = _aligned_scores(scores, pred_ids, n_pred)
+
+        if n_pred == 0 or n_gt == 0:
+            pq_fp += n_pred
+            pq_fn += n_gt
+            for t in iou_thresholds:
+                ap_entries[t].extend((sc, 0) for sc in pred_scores)
+            continue
+
+        # Hungarian match for mean IoU / recall.
+        r, c = linear_sum_assignment((-iou).cpu().numpy())
+        matched = iou[r, c]
+        iou_sum += float(matched.sum())
         for t in iou_thresholds:
-            tp_total[t] += tp[t]
+            tp_recall[t] += int((matched >= t).sum())
+
+        # Panoptic Quality (unique matches with IoU > 0.5).
+        hit = matched > 0.5
+        n_hit = int(hit.sum())
+        pq_iou_sum += float(matched[hit].sum())
+        pq_tp += n_hit
+        pq_fp += n_pred - n_hit
+        pq_fn += n_gt - n_hit
+
+        # Mask AP: per-image, rank preds by score, greedily take the best
+        # unmatched GT at >= threshold.
+        order = sorted(range(n_pred), key=lambda i: -pred_scores[i])
+        for t in iou_thresholds:
+            taken = [False] * n_gt
+            for pi in order:
+                best_g, best_iou = -1, t
+                for gj in range(n_gt):
+                    if not taken[gj] and float(iou[pi, gj]) >= best_iou:
+                        best_iou, best_g = float(iou[pi, gj]), gj
+                if best_g >= 0:
+                    taken[best_g] = True
+                    ap_entries[t].append((pred_scores[pi], 1))
+                else:
+                    ap_entries[t].append((pred_scores[pi], 0))
+
     mean_iou = iou_sum / n_gt_total if n_gt_total else 0.0
-    recall_at = {t: (tp_total[t] / n_gt_total if n_gt_total else 0.0) for t in iou_thresholds}
+    recall_at = {t: (tp_recall[t] / n_gt_total if n_gt_total else 0.0) for t in iou_thresholds}
+    mask_ap = {t: _ap_from_entries(ap_entries[t], n_gt_total) for t in iou_thresholds}
+    pq = pq_iou_sum / (pq_tp + 0.5 * pq_fp + 0.5 * pq_fn) if (pq_tp + pq_fp + pq_fn) else 0.0
     return InstanceSegMetrics(
-        mean_iou=mean_iou, recall_at=recall_at, n_gt=n_gt_total, n_pred=n_pred_total,
+        mean_iou=mean_iou, recall_at=recall_at, mask_ap=mask_ap, pq=pq,
+        n_gt=n_gt_total, n_pred=n_pred_total,
     )
