@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib import patches
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from torch.utils.data import Dataset
 from torch.utils.data._utils.collate import default_collate
 
@@ -159,17 +159,11 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                  save_location: str = "shape_dataset",
                  seed: Optional[int] = None,
                  with_masks: bool = False,
-                 with_instances: bool = False,):
+                 with_instances: bool = False,
+                 blur: float = 0.0,
+                 color_threshold: float = 50.0,):
         validate_shape_size_range(image_size, shape_size_range)
         need_label = with_masks or with_instances
-        if need_label and shape_outline != ShapeOutline.FILL:
-            # Outline-only shapes leave their interior background-colored, so a
-            # filled mask wouldn't match the image. v1 masks require filled
-            # shapes (also the GPU path's only mode).
-            raise NotImplementedError(
-                "with_masks/with_instances currently require shape_outline=FILL "
-                f"(got {shape_outline}); outlined-shape masks aren't supported yet."
-            )
         if need_label and fixed_dataset:
             # The fixed-dataset cache only stores (img, annotations); masks
             # aren't persisted, so a cached item would return a None mask.
@@ -178,6 +172,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
             )
         self.with_masks = with_masks
         self.with_instances = with_instances
+        self.blur = blur
+        self.color_threshold = color_threshold
         self.num_images = num_images
         self.image_size = image_size
         self.num_shapes_range = num_shapes_range
@@ -365,12 +361,14 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
 
         num_shapes = rng.randint(*self.num_shapes_range)
         existing_boxes: list[BoundingBox] = []
-        # (draw-primitive, coords, class) per shape, for the segmentation label
-        # map. Recorded in draw order and rendered onto a label canvas below.
-        mask_specs: list[tuple[str, Any, int]] = []
+        need_label = self.with_masks or self.with_instances
+        # (draw-primitive, coords, class, use_fill, outline_width) per shape, for
+        # the label map. Recorded in draw order and rendered onto a label canvas
+        # below, mirroring the image's fill/outline so the mask matches it.
+        mask_specs: list[tuple[str, Any, int, bool, int]] = []
         for _ in range(num_shapes):
             shape_type = rng.choice(self.shape_types)
-            shape_color = select_shape_color(bg_color, rng=rng)
+            shape_color = select_shape_color(bg_color, threshold=self.color_threshold, rng=rng)
 
             min_size, max_size = self.shape_size_range
             max_width = min(max_size, self.image_size[0] // 2)
@@ -405,14 +403,15 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 outline_width = rng.randint(ShapeOutline.THIN.value, max_outline)
             else:
                 outline_width = self.shape_outline.value
+            use_fill = self.shape_outline == ShapeOutline.FILL or outline_width == max_outline
 
             if shape_type == ShapeType.RECTANGLE:
                 if self.rotate_shapes:
                     corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
                     center = ((x0 + x1) / 2, (y0 + y1) / 2)
                     rotated_corners, bbox = self.rotate_shape_points(corners, center)
-                    if self.with_masks:
-                        mask_specs.append(("polygon", rotated_corners, shape_type.value))
+                    if need_label:
+                        mask_specs.append(("polygon", rotated_corners, shape_type.value, use_fill, outline_width))
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                         draw.polygon(
                             rotated_corners,
@@ -425,8 +424,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                             width=outline_width
                         )
                 else:
-                    if self.with_masks:
-                        mask_specs.append(("rectangle", list(bbox), shape_type.value))
+                    if need_label:
+                        mask_specs.append(("rectangle", list(bbox), shape_type.value, use_fill, outline_width))
                     if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                         draw.rectangle(
                             bbox,
@@ -439,8 +438,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                             width=outline_width
                         )
             elif shape_type == ShapeType.CIRCLE:
-                if self.with_masks:
-                    mask_specs.append(("ellipse", list(bbox), shape_type.value))
+                if need_label:
+                    mask_specs.append(("ellipse", list(bbox), shape_type.value, use_fill, outline_width))
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                     draw.ellipse(
                         bbox,
@@ -463,8 +462,8 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
                 )
                 if self.rotate_shapes:
                     points, bbox = self.rotate_shape_points(points, center)
-                if self.with_masks:
-                    mask_specs.append(("polygon", points, shape_type.value))
+                if need_label:
+                    mask_specs.append(("polygon", points, shape_type.value, use_fill, outline_width))
                 if self.shape_outline == ShapeOutline.FILL or outline_width == max_outline:
                     draw.polygon(
                         points,
@@ -487,19 +486,26 @@ class ShapeDataset(Dataset[tuple[Any, list[Annotation]]]):
 
         if self.add_noise:
             img = add_gaussian_noise(img, np_rng=np_rng)
+        if self.blur > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=self.blur))
 
         label = None
         if self.with_masks or self.with_instances:
             # Render the recorded shapes onto a label canvas in the same draw
-            # order, so the mask matches the image pixel-for-pixel including
-            # overlaps. Semantic: fill with the class, background=len(ShapeType).
-            # Instance: fill with the 1-based shape index, background=0.
+            # order (and the same fill/outline), so the mask matches the image
+            # pixel-for-pixel including overlaps and outlined shapes. Semantic:
+            # fill with the class, background=len(ShapeType). Instance: fill with
+            # the 1-based shape index, background=0. (Blur is NOT applied to the
+            # label — labels stay crisp.)
             bg = 0 if self.with_instances else len(ShapeType)
             label_img = Image.new("L", self.image_size, bg)
             label_draw = ImageDraw.Draw(label_img)
-            for inst_idx, (kind, coords, cls) in enumerate(mask_specs):
-                fill = (inst_idx + 1) if self.with_instances else cls
-                getattr(label_draw, kind)(coords, fill=fill)
+            for inst_idx, (kind, coords, cls, use_fill, width) in enumerate(mask_specs):
+                value = (inst_idx + 1) if self.with_instances else cls
+                if use_fill:
+                    getattr(label_draw, kind)(coords, fill=value)
+                else:
+                    getattr(label_draw, kind)(coords, outline=value, width=width)
             label = torch.from_numpy(np.array(label_img, dtype=np.int64))  # (H, W)
 
         return img, annotations, label

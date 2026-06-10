@@ -79,11 +79,25 @@ def test_cpu_masks_collate_through_dataloader():
     assert int(masks.max()) <= BG
 
 
-def test_with_masks_requires_filled_shapes():
-    with pytest.raises(NotImplementedError):
-        ShapeDataset(
-            image_size=(64, 64), shape_outline=ShapeOutline.THIN, with_masks=True,
-        )
+def test_outlined_shape_mask_matches_image():
+    """Masks now support outlined shapes (CPU): the mask draws the same outline,
+    so it matches the image (interior stays background, not filled)."""
+    ds = ShapeDataset(
+        num_images=1, seed=0, image_size=(64, 64),
+        num_shapes_range=(1, 1), shape_size_range=(24, 30),
+        shape_types=(ShapeType.RECTANGLE,), shape_outline=ShapeOutline.THIN,
+        rotate_shapes=False, transform=transforms.ToTensor(), with_masks=True,
+    )
+    img, ann, mask = ds[0]
+    bg_pix = img[:, mask == BG]            # (3, Nbg)
+    bgcol = bg_pix[:, 0:1]
+    fg = img[:, mask != BG]
+    # mask foreground <=> image differs from the (solid) background colour.
+    assert bool((fg != bgcol).any(0).all())
+    # The rectangle interior (its centre) is NOT filled in an outlined mask.
+    x0, y0, x1, y1 = ann[0].bbox
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    assert int(mask[cy, cx]) == BG
 
 
 def test_with_masks_rejects_fixed_dataset():
