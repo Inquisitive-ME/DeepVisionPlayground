@@ -592,23 +592,23 @@ def evaluate_classification(model, loader, device):
 
 
 def evaluate_instance_seg(model, loader, device, max_objects):
-    """Decode instances (semantic + nearest-center grouping), upsample to GT
-    resolution, and match to the GT instance maps (matched IoU / recall@IoU)."""
+    """Decode instances (semantic + offset grouping), upsample to GT resolution,
+    and match to the GT instance maps (matched IoU / recall@IoU / mask-AP / PQ)."""
     model.eval()
-    pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    triples: list[tuple[torch.Tensor, ...]] = []
     with torch.no_grad():
         for batch in loader:
             images, inst_gt = batch[0], batch[2]  # inst_gt: (B, H, W) instance ids
             if images.device != device:
                 images = images.to(device, non_blocking=True)
-            _, pred_inst = model.decode(model(images), max_objects=max_objects)
+            _, pred_inst, scores = model.decode(model(images), max_objects=max_objects)
             if pred_inst.shape[-2:] != inst_gt.shape[-2:]:
                 pred_inst = F.interpolate(
                     pred_inst.unsqueeze(1).float(), size=inst_gt.shape[-2:], mode="nearest",
                 ).squeeze(1).long()
             for b in range(pred_inst.shape[0]):
-                pairs.append((pred_inst[b].cpu(), inst_gt[b].cpu()))
-    return evaluate_instance_segmentation(pairs).to_dict()
+                triples.append((pred_inst[b].cpu(), inst_gt[b].cpu(), scores[b].cpu()))
+    return evaluate_instance_segmentation(triples).to_dict()
 
 
 def main() -> None:
@@ -828,7 +828,7 @@ def main() -> None:
                             centers_per_image.append(torch.zeros((0, 2), dtype=torch.float32, device=device))
                     class_map = torch.stack(class_maps)
                     out = model(images)
-                    terms = instance_seg_loss_fn(out, class_map, centers_per_image)
+                    terms = instance_seg_loss_fn(out, class_map, masks, centers_per_image)
                     loss = terms.total
                     sums["hm_heatmap"] += float(terms.heatmap.detach()) * images.size(0)
                 else:
@@ -877,7 +877,8 @@ def main() -> None:
             final_metrics = vm
 
             interesting_substrings = (
-                "_px", "accuracy", "map", "pearson", "miou", "pixel_acc", "mean_iou", "recall@0",
+                "_px", "accuracy", "map", "pearson", "miou", "pixel_acc",
+                "mean_iou", "recall@0", "ap@0", "/pq",
             )
             extras = ", ".join(
                 f"{k.split('/')[-1]}={v:.3f}"

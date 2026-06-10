@@ -42,6 +42,7 @@ from data.dataset_config import DatasetConfig, build_cpu_dataset
 from data.synthetic_shapes_dataset import ShapeDataset
 from models.center_heatmap_net import CenterHeatmapNet
 from models.encoders import EncodeType
+from models.instance_seg_net import InstanceSegNet
 from models.multi_heatmap_net import MultiHeatmapNet
 from models.multiple_center_predictor import CenterPredictor
 from models.seg_net import ShapeSegNet
@@ -120,6 +121,8 @@ def _load_run(run_dir: Path) -> tuple[torch.nn.Module, dict[str, Any], _ValDefau
         )
     elif cfg["task"] == "segmentation":
         model = ShapeSegNet(num_classes=num_classes, stride=int(cfg.get("seg_stride", 1)))
+    elif cfg["task"] == "instance_seg":
+        model = InstanceSegNet(num_classes=num_classes, stride=int(cfg.get("seg_stride", 1)))
     elif cfg["task"] == "classification":
         model = ShapeClassifier(num_classes=num_classes, encoder_type=encoder_type)
     else:  # multi
@@ -165,6 +168,7 @@ def _build_loader(d: _ValDefaults, device: torch.device) -> Any:
         d.dataset, num_images=d.num_val_images, image_size=d.image_size,
         seed=d.val_seed, transform=transforms.ToTensor(),
         with_masks=d.task == "segmentation",
+        with_instances=d.task == "instance_seg",
     )
     return DataLoader(
         ds, batch_size=d.batch_size, shuffle=False,
@@ -180,6 +184,7 @@ def _evaluate(model: torch.nn.Module, loader: Any, defaults: _ValDefaults,
     from scripts.run_training import (
         evaluate_classification,
         evaluate_heatmap,
+        evaluate_instance_seg,
         evaluate_multi,
         evaluate_multi_heatmap,
         evaluate_seg,
@@ -188,6 +193,8 @@ def _evaluate(model: torch.nn.Module, loader: Any, defaults: _ValDefaults,
     class_names = tuple(s.name for s in ShapeType)
     if defaults.task == "classification":
         return evaluate_classification(model, loader, device)
+    if defaults.task == "instance_seg":
+        return evaluate_instance_seg(model, loader, device, defaults.max_objects)
     if defaults.task == "single":
         return evaluate_single(model, loader, device, defaults.image_size)
     if defaults.task == "heatmap":
@@ -222,6 +229,9 @@ def _sweep(model: torch.nn.Module, defaults: _ValDefaults, device: torch.device,
         if defaults.task == "segmentation":
             print(f"  {label:>20s}: mIoU={vm.get('seg/miou', 0.0):.3f}  "
                   f"pixel_acc={vm.get('seg/pixel_acc', 0.0):.3f}")
+        elif defaults.task == "instance_seg":
+            print(f"  {label:>20s}: mean_iou={vm.get('instance/mean_iou', 0.0):.3f}  "
+                  f"PQ={vm.get('instance/pq', 0.0):.3f}  AP50={vm.get('instance/ap@0.5', 0.0):.3f}")
         elif defaults.task == "classification":
             print(f"  {label:>20s}: accuracy={vm.get('classification/accuracy', 0.0):.3f}")
         else:
