@@ -45,22 +45,30 @@ def _simple_stack(norm: str) -> nn.Sequential:
 def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
     if encoder_type is EncodeType.simple:
         # Original 4-conv stack. Keeps spatial 16x16x128 features so a FC
-        # head can localize. Flatten included so the encoder always emits
-        # a 2-D tensor; SimpleCenterNet's own Flatten then becomes a no-op.
-        model: nn.Module = nn.Sequential(_simple_stack(norm="none"), nn.Flatten())
+        # head can localize. The AdaptiveAvgPool2d((16, 16)) pins the feature
+        # grid to 16x16 regardless of input size, so the flattened head size is
+        # fixed (works at any --image-size); it is an exact no-op at 256px,
+        # where the stride-16 stack already emits 16x16.
+        model: nn.Module = nn.Sequential(
+            _simple_stack(norm="none"), nn.AdaptiveAvgPool2d((16, 16)), nn.Flatten(),
+        )
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_bn:
         # Same stack with BatchNorm after every conv. Converges quickly but
         # uses running stats that drift on fresh-data-per-epoch training, so
         # eval predictions diverge from train — NOT suitable for distribution-
         # shift studies. Prefer simple_gn for those.
-        model = nn.Sequential(_simple_stack(norm="batch"), nn.Flatten())
+        model = nn.Sequential(
+            _simple_stack(norm="batch"), nn.AdaptiveAvgPool2d((16, 16)), nn.Flatten(),
+        )
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_gn:
         # Same stack with GroupNorm. Per-sample normalization, so train and
         # eval behave identically — the right default for the localization
         # tasks and for honest distribution-shift measurement.
-        model = nn.Sequential(_simple_stack(norm="group"), nn.Flatten())
+        model = nn.Sequential(
+            _simple_stack(norm="group"), nn.AdaptiveAvgPool2d((16, 16)), nn.Flatten(),
+        )
         features_out_size = 128 * 16 * 16
     elif encoder_type is EncodeType.simple_gap:
         # GAP'd to 128 features. Removes the 8M-parameter FC head you'd
@@ -105,6 +113,7 @@ def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
         model = nn.Sequential(
             rn18.conv1, rn18.bn1, rn18.relu, rn18.maxpool,
             rn18.layer1, rn18.layer2, rn18.layer3, rn18.layer4,
+            nn.AdaptiveAvgPool2d((8, 8)),  # pin grid to 8x8 (no-op at 256px) -> size-agnostic head
             nn.Flatten(),
         )
         features_out_size = 512 * 8 * 8
@@ -118,6 +127,7 @@ def encoder(encoder_type: EncodeType) -> tuple[nn.Module, int]:
         model = nn.Sequential(
             rn34.conv1, rn34.bn1, rn34.relu, rn34.maxpool,
             rn34.layer1, rn34.layer2, rn34.layer3, rn34.layer4,
+            nn.AdaptiveAvgPool2d((8, 8)),  # pin grid to 8x8 (no-op at 256px) -> size-agnostic head
             nn.Flatten(),
         )
         features_out_size = 512 * 8 * 8
